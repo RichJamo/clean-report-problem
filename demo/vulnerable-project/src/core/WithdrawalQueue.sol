@@ -10,12 +10,16 @@ pragma solidity 0.8.24;
 ///        - A request is settled at most once (`settled` is monotonic).
 ///        - A request settles only at or after `unlockAt`.
 ///        - Only the recorded `account` can settle its own request.
+///        - The fee quoted when a request is created is the fee it settles at.
 contract WithdrawalQueue {
     struct Request {
         address account;
         uint256 assets;
         uint64 unlockAt;
         bool settled;
+        /// @dev Fee rate captured when the request was created, so a later fee
+        ///      change cannot be applied retroactively to a pending exit.
+        uint256 feeBps;
     }
 
     /// @notice The vault permitted to enqueue and settle.
@@ -33,7 +37,9 @@ contract WithdrawalQueue {
     error AlreadySettled(uint256 id);
     error StillLocked(uint256 id, uint64 unlockAt);
 
-    event Enqueued(uint256 indexed id, address indexed account, uint256 assets, uint64 unlockAt);
+    event Enqueued(
+        uint256 indexed id, address indexed account, uint256 assets, uint64 unlockAt, uint256 feeBps
+    );
     event Settled(uint256 indexed id, address indexed account, uint256 assets);
 
     modifier onlyVault() {
@@ -59,19 +65,37 @@ contract WithdrawalQueue {
     }
 
     /// @notice Record a new exit request for `account`.
+    /// @param feeBps The exit fee in force now, held for this request.
     /// @return id The identifier the account will settle with.
-    function enqueue(address account, uint256 assets) external onlyVault returns (uint256 id) {
+    function enqueue(address account, uint256 assets, uint256 feeBps)
+        external
+        onlyVault
+        returns (uint256 id)
+    {
         uint64 unlockAt = uint64(block.timestamp) + cooldown;
-        _requests.push(Request({account: account, assets: assets, unlockAt: unlockAt, settled: false}));
+        _requests.push(
+            Request({
+                account: account,
+                assets: assets,
+                unlockAt: unlockAt,
+                settled: false,
+                feeBps: feeBps
+            })
+        );
         id = _requests.length - 1;
-        emit Enqueued(id, account, assets, unlockAt);
+        emit Enqueued(id, account, assets, unlockAt, feeBps);
     }
 
     /// @notice Mark request `id` settled on behalf of `caller`.
     /// @dev Reverts unless `caller` owns the request, the cooldown has elapsed,
     ///      and the request has not been settled before. Returns the amount the
-    ///      vault owes so the vault performs the transfer, not this contract.
-    function settle(uint256 id, address caller) external onlyVault returns (uint256 assets) {
+    ///      vault owes and the fee rate agreed at request time, so the vault
+    ///      performs the transfer, not this contract.
+    function settle(uint256 id, address caller)
+        external
+        onlyVault
+        returns (uint256 assets, uint256 feeBps)
+    {
         if (id >= _requests.length) revert UnknownRequest(id);
         Request storage request = _requests[id];
 
@@ -81,6 +105,7 @@ contract WithdrawalQueue {
 
         request.settled = true;
         assets = request.assets;
+        feeBps = request.feeBps;
 
         emit Settled(id, caller, assets);
     }

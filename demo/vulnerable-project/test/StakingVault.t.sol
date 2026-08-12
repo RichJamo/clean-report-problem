@@ -180,8 +180,26 @@ contract StakingVaultTest is TestBase {
 
     function test_OnlyVaultCanEnqueue() public {
         WithdrawalQueue queue = vault.withdrawalQueue();
-        try queue.enqueue(alice, 1 ether) {
+        try queue.enqueue(alice, 1 ether, 0) {
             revert("non-vault caller enqueued");
         } catch {}
+    }
+
+    function test_FeeIsLockedAtRequestTime() public {
+        vm.prank(alice);
+        vault.deposit(100 ether);
+        vm.prank(alice);
+        uint256 id = vault.requestWithdrawal(100 ether);
+
+        // The fee is raised to the cap while alice is in the cooldown.
+        fees.setWithdrawalFeeBps(fees.MAX_FEE_BPS());
+
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(alice);
+        uint256 paid = vault.completeWithdrawal(id);
+
+        uint256 expectedFee = (100 ether * FEE_BPS) / fees.BPS_DENOMINATOR();
+        assertEq(paid, 100 ether - expectedFee, "fee change applied retroactively");
     }
 }

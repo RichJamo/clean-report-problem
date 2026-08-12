@@ -1,0 +1,215 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            01
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T13:45:48Z
+# duration-ms:    225003
+# num-turns:      16
+# context-tokens: 99491
+# output-tokens:  13477
+# cost-usd:       0.3055002
+# is-error:       False
+# session-id:     c0658486-7f3a-4c48-a647-7ee48ccd7ee5
+# ---- agent output below this line ----
+Now I have a complete picture of the codebase. Let me compile the audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `SafeTransferLib`, `FixedPointMath`
+**Date:** 2026-08-12
+
+---
+
+## Finding 1 — CRITICAL: `RewardDistributor.claim()` never zeros `accrued`, enabling unlimited token drain
+
+**File:** `src/rewards/RewardDistributor.sol`
+**Function:** `claim()` (line 119)
+
+### What an attacker can do
+Drain the entire reward token balance of `RewardDistributor` by calling `claim()` in a loop, receiving the same `accrued` payout on every call.
+
+### Vulnerable code
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);   // paid out
+    // ← accrued[msg.sender] is NEVER reset to 0
+}
+```
+
+After the transfer, `accrued[msg.sender]` retains its value. On the next call, `_pendingFor` returns 0 (because `userIndex[msg.sender] == globalIndex`), so `amount = accrued[msg.sender] + 0`. The same amount is paid out again, and again, until the contract is empty.
+
+### Conditions required
+1. The attacker has staked tokens in the vault.
+2. `notifyReward` has been called at least once (so `globalIndex > 0`).
+3. The attacker triggers a checkpoint by changing their balance — either depositing more assets or calling `requestWithdrawal`. The vault calls `distributor.checkpoint(account)` first, which executes `accrued[account] += pending` (`RewardDistributor.sol` line 92–93) and sets `userIndex[account] = globalIndex`. After this point, `accrued[account]` is non-zero and permanently stuck.
+
+### Attack scenario
+```
+Alice stakes 100 ether asset.
+Owner calls notifyReward(100 ether)  → globalIndex = 1e18.
+Alice deposits 1 wei more            → checkpoint fires: accrued[Alice] = 100e18, userIndex[Alice] = globalIndex.
+Alice calls claim()                  → receives 100e18 reward tokens. accrued[Alice] still = 100e18.
+Alice calls claim() again            → receives another 100e18. Repeats until distributor is empty.
+```
+
+### Fix
+Add `accrued[msg.sender] = 0;` immediately before the transfer:
+```solidity
+accrued[msg.sender] = 0;
+userIndex[msg.sender] = globalIndex;
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+```
+
+---
+
+## Finding 2 — HIGH: Fee rate is applied at completion time, not at request time
+
+**File:** `src/core/StakingVault.sol`
+**Function:** `completeWithdrawal()` (line 163)
+
+### What an attacker can do
+The vault owner (or FeeController owner, if different) can raise the withdrawal fee to the maximum (500 bps, 5%) at any moment during the cooldown window. Users who requested a withdrawal when the fee was 0% can have 5% silently deducted at completion.
+
+### Vulnerable code
+```solidity
+// completeWithdrawal — fee is read from live state, not from the queued record
+uint256 fee = assets.mulDiv(feeController.withdrawalFeeBps(), feeController.BPS_DENOMINATOR());
+```
+
+The `WithdrawalQueue.Request` struct stores only `account`, `assets`, `unlockAt`, and `settled`. The fee rate at request time is not recorded. Similarly, `feeController.feeRecipient()` can be changed between request and completion, redirecting fees to any address.
+
+### Conditions required
+- A user has an outstanding, not-yet-matured withdrawal request.
+- The FeeController owner calls `setWithdrawalFeeBps(MAX_FEE_BPS)` before the user calls `completeWithdrawal`.
+- Because `requestWithdrawal` burns shares immediately, the user cannot cancel and re-deposit; they are locked in for the cooldown period with no recourse.
+
+### Fix
+Snapshot the fee rate (and fee recipient) into the `WithdrawalQueue.Request` struct at enqueue time, and apply that snapshot at completion.
+
+---
+
+## Finding 3 — MEDIUM: `notifyReward` updates state after the external token transfer (CEI violation)
+
+**File:** `src/rewards/RewardDistributor.sol`
+**Function:** `notifyReward()` (line 103)
+
+### What an attacker can do
+If `rewardToken` implements a transfer callback (e.g., ERC-777 `tokensToSend`/`tokensReceived`), the callback fires while `globalIndex` and `totalNotified` still hold their pre-notification values. The attacker's callback executes with stale accounting state.
+
+### Vulnerable code
+```solidity
+rewardToken.safeTransferFrom(msg.sender, address(this), amount); // ← external call
+
+totalNotified += amount;   // ← state updates happen after
+globalIndex += amount.mulDiv(FixedPointMath.WAD, supply);
+```
+
+The `nonReentrant` guard on `notifyReward` prevents re-entry into `notifyReward` itself, but a callback could invoke other state-reading functions (e.g., `claimable`) that return stale values and allow off-chain observation of inconsistent state or basis for a flash-loan setup in a more complex scenario.
+
+### Conditions required
+- `rewardToken` implements a hook that calls back into the distributor during `transferFrom`.
+- The callback exploits the window between the transfer and the index update.
+
+### Fix
+Move state updates before the transfer (Checks-Effects-Interactions):
+```solidity
+totalNotified += amount;
+globalIndex += amount.mulDiv(FixedPointMath.WAD, supply);
+rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+```
+
+---
+
+## Finding 4 — LOW: `Ownable2Step.transferOwnership` accepts `address(0)` as `newOwner`
+
+**File:** `src/auth/Ownable2Step.sol`
+**Function:** `transferOwnership()` (line 30)
+
+### What an attacker can do
+The current owner can accidentally (or intentionally) call `transferOwnership(address(0))`. This sets `pendingOwner = address(0)` and emits `OwnershipTransferStarted(owner, address(0))`. Since no EOA or contract has address zero as its key, `acceptOwnership` can never be called, silently orphaning any previous legitimate pending transfer. The current owner retains ownership but the pending-owner slot is polluted.
+
+### Conditions required
+- Owner mistypes or passes zero when initiating a transfer.
+- No prior guards or off-chain tooling catch the call.
+
+### Fix
+Add `require(newOwner != address(0))` at the top of `transferOwnership`, consistent with the zero-address guard already present in the constructor.
+
+---
+
+## Finding 5 — LOW: `FixedPointMath.mulDiv` uses naive multiplication with no overflow-safe intermediate
+
+**File:** `src/libraries/FixedPointMath.sol`
+**Function:** `mulDiv()` (line 14)
+
+### What an attacker can do
+The implementation computes `(x * y) / d` directly. For Solidity 0.8 this reverts on overflow rather than wrapping, so the impact is denial-of-service rather than incorrect arithmetic. Key call sites:
+
+| Call site | Expression | Overflow condition |
+|---|---|---|
+| `RewardDistributor.notifyReward` | `amount * WAD` | `amount > ~1.16 × 10⁵⁹` tokens |
+| `RewardDistributor._pendingFor` | `balance * delta` | `balance * (globalIndex - userIndex) > 2²⁵⁶` |
+| `StakingVault.convertToShares` | `assets * supply` | `assets * supply > 2²⁵⁶` |
+
+With 18-decimal tokens at normal magnitudes this is unlikely, but a vault that accumulates very large balances and a large `globalIndex` delta can reach overflow, permanently bricking `claim()` and `deposit()` for affected accounts.
+
+### Fix
+Replace the naive implementation with a 512-bit overflow-safe `mulDiv` (e.g., the algorithm from Solmate or OpenZeppelin's `Math.mulDiv`).
+
+---
+
+## Finding 6 — INFORMATIONAL: `WithdrawalCompleted` event conflates `paid` (net) with the `assets` field name
+
+**File:** `src/core/StakingVault.sol`
+**Function:** `completeWithdrawal()` (line 163); event declaration line 71
+
+### What an attacker can do
+No on-chain impact. Off-chain indexers and front-ends that rely on the event's `assets` field will receive the net amount after fee deduction, not the gross amount recorded in the withdrawal queue. This can cause incorrect accounting in dashboards, tax tools, and analytics.
+
+```solidity
+event WithdrawalCompleted(address indexed account, uint256 indexed id, uint256 assets, uint256 fee);
+//                                                                                    ^ actually `paid` (net)
+emit WithdrawalCompleted(msg.sender, id, paid, fee);
+```
+
+### Fix
+Rename the event parameter to `paid` or `netAssets`, or emit the gross `assets` value separately.
+
+---
+
+## Finding 7 — INFORMATIONAL: Zero cooldown is accepted in `WithdrawalQueue`
+
+**File:** `src/core/WithdrawalQueue.sol`
+**Constructor** (line 44)
+
+### What an attacker can do
+If `cooldown_ = 0` is passed at deployment, `requestWithdrawal` and `completeWithdrawal` can be called in the same block. Any slashing or loss-socialization mechanism that depends on the cooldown window having elapsed before assets leave has no protection. This is a deployment-time configuration risk.
+
+### Fix
+Add `require(cooldown_ > 0, "COOLDOWN_ZERO")` in the constructor, or document explicitly that zero cooldown is a supported configuration.
+
+---
+
+## Vulnerability Summary
+
+| # | Severity | Contract | Function | Title |
+|---|---|---|---|---|
+| 1 | **Critical** | `RewardDistributor` | `claim()` | `accrued` never zeroed — unlimited token drain |
+| 2 | **High** | `StakingVault` | `completeWithdrawal()` | Fee applied at completion time, not request time |
+| 3 | **Medium** | `RewardDistributor` | `notifyReward()` | State updated after external call (CEI violation) |
+| 4 | **Low** | `Ownable2Step` | `transferOwnership()` | Accepts `address(0)` as pending owner |
+| 5 | **Low** | `FixedPointMath` | `mulDiv()` | Naive multiply overflows at large values (DoS) |
+| 6 | **Info** | `StakingVault` | `completeWithdrawal()` | Event field name `assets` emits net amount |
+| 7 | **Info** | `WithdrawalQueue` | constructor | Zero cooldown permitted without validation |

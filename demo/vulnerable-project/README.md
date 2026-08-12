@@ -75,6 +75,9 @@ into `accrued[account]`.
   has already been wired, so the reward stream cannot be repointed later.
 - **The withdrawal queue never holds tokens.** It records who is owed what and
   when; the vault performs the transfer.
+- **The exit fee is quoted at request time.** Each request stores the fee rate
+  in force when it was created, so changing the fee cannot alter the terms of an
+  exit already in its cooldown.
 
 ## Build
 

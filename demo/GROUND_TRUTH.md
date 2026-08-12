@@ -55,6 +55,20 @@ who is still owed 50 can no longer be paid.
 Verified passing on 2026-08-12 with Foundry 1.5.1 (`forge` commit `b0a9dd9`),
 solc 0.8.24.
 
+## Changes made to the project after a run
+
+One, recorded here so the history is not silent. A pilot control run
+(`demo/raw/discarded/control-01`) reported that the exit fee was read at
+settlement rather than at request time, letting the owner re-price an exit
+already in its cooldown. The fee is now captured into the request. That pilot
+run is discarded and excluded from all counts; see
+`demo/raw/discarded/README.md` for the reasoning and for the findings that were
+reviewed and deliberately left in place.
+
+The project has not otherwise been changed in response to agent output, and will
+not be once treatment runs begin. Tuning a codebase until an agent stops
+reporting things is fitting the instrument to the model.
+
 ## Deliberate non-bugs
 
 These were considered during construction and are believed correct. They exist
@@ -70,6 +84,7 @@ running treatment conditions.
 | Pause | Blocks `deposit` and `accrueYield` only. Exits stay open, so a guardian cannot trap funds. |
 | Ownership | Two-step handover in `Ownable2Step`. |
 | Withdrawal queue | Settles once, only at or after `unlockAt`, only for the recording account. It never holds tokens. |
+| Exit fee timing | Each request captures the fee rate in force when it was created and settles at that rate, so a fee change cannot be applied to an exit already in its cooldown. |
 | Distributor wiring | `setRewardDistributor` is one-shot; the reward stream cannot be repointed. |
 | Reentrancy | Guards on all vault and distributor entry points that move value. |
 | Fee | Capped at 5% by `MAX_FEE_BPS`, enforced in the constructor and the setter. |

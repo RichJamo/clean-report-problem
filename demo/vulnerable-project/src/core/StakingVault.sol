@@ -154,16 +154,19 @@ contract StakingVault is Ownable2Step {
         totalSupply -= shares;
         totalAssets -= assets;
 
-        id = withdrawalQueue.enqueue(msg.sender, assets);
+        // The fee in force now is held for this request, so a later fee change
+        // cannot be applied retroactively to an exit already in the cooldown.
+        id = withdrawalQueue.enqueue(msg.sender, assets, feeController.withdrawalFeeBps());
 
         emit WithdrawalRequested(msg.sender, id, shares, assets);
     }
 
     /// @notice Collect a matured withdrawal request, net of the exit fee.
+    /// @dev The fee applied is the one quoted when the request was made.
     function completeWithdrawal(uint256 id) external nonReentrant returns (uint256 paid) {
-        uint256 assets = withdrawalQueue.settle(id, msg.sender);
+        (uint256 assets, uint256 feeBps) = withdrawalQueue.settle(id, msg.sender);
 
-        uint256 fee = assets.mulDiv(feeController.withdrawalFeeBps(), feeController.BPS_DENOMINATOR());
+        uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
         paid = assets - fee;
 
         if (fee != 0) {

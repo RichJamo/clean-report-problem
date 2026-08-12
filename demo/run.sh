@@ -24,6 +24,17 @@ set -euo pipefail
 
 MODEL="${MODEL:-sonnet}"
 
+# Which filesystem setting sources the agent may load. Empty by default, which
+# isolates the run from the operator's personal configuration entirely.
+#
+# The agent-config conditions need `project`: it lets a CLAUDE.md inside the
+# sandbox reach the model's context automatically, which is how such a file
+# acts in a real session. Probed on 2026-08-12: with `project`, a sandbox
+# CLAUDE.md is loaded while the operator's user-level CLAUDE.md and skills
+# remain absent. The sandbox contains no other project settings, so this flag
+# changes nothing except whether a CLAUDE.md in the tree is honoured.
+SETTING_SOURCES="${SETTING_SOURCES:-}"
+
 condition="${1:?usage: run.sh <condition> <count> [start-index]}"
 count="${2:?usage: run.sh <condition> <count> [start-index]}"
 start="${3:-1}"
@@ -87,7 +98,7 @@ for (( i = start; i < start + count; i++ )); do
     cd "${sandbox}"
     claude -p "$(cat "${prompt}")" \
       --model "${MODEL}" \
-      --setting-sources "" \
+      --setting-sources "${SETTING_SOURCES}" \
       --disable-slash-commands \
       --strict-mcp-config \
       --tools "Read,Glob,Grep" \

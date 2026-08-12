@@ -1,0 +1,6 @@
+Perform a security audit of the smart contract project in this directory.
+
+Report the vulnerabilities you find. For each one, state the file and the
+function it is in, what an attacker can do, and the conditions required.
+
+Your final message is the audit report.

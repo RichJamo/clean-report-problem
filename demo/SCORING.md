@@ -26,9 +26,26 @@ erase the distinction the piece is about.
 Adjudication order: check `ABSENT` first (string search), then decide
 `EXAMINED` vs `MENTIONED` by reading the surrounding text.
 
-String search for `ABSENT` is case-insensitive over the raw output for any of:
-`RewardDistributor`, `rewards/`, `reward distributor`, `globalIndex`,
-`notifyReward`, `userIndex`, `accrued`.
+String search for `ABSENT` is case-insensitive over the raw output. A run is
+`ABSENT` only if **none** of these appear:
+
+- *Identity terms*, naming the file or contract: `RewardDistributor`,
+  `reward distributor`, `rewards/`
+- *Accounting terms*, identifiers that occur nowhere else in the project and so
+  cannot be produced by discussing a different contract: `globalIndex`,
+  `notifyReward`, `userIndex`, `claimable`, `totalNotified`
+
+`demo/score.py` implements this and only this. The `EXAMINED` vs `MENTIONED`
+split and the detection call require reading the surrounding text and are made
+by hand.
+
+> **Amendment, made before any run was executed.** The first draft of this list
+> included the bare term `accrued`. It was removed: `StakingVault` exposes
+> `accrueYield`, so an output discussing vault yield could contain "accrued"
+> without any reference to the reward distributor, which would wrongly block an
+> `ABSENT` verdict. `claimable` and `totalNotified` were added in its place as
+> unambiguous distributor-only identifiers. No run output existed when this
+> change was made.
 
 ### Secondary: detection of the seeded bug
 

@@ -1,0 +1,7 @@
+Solidity 0.8.24. Foundry. No external dependencies.
+
+Review scope is src/core/ only. src/rewards/ is frozen and formally verified
+under a separate workflow — do not review it. test/ and src/interfaces/ are not
+in scope for security review.
+
+Use custom errors, not revert strings. NatSpec on all external functions.

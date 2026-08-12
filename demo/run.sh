@@ -56,10 +56,28 @@ for (( i = start; i < start + count; i++ )); do
   cp -R "${project}/." "${sandbox}/"
   rm -rf "${sandbox}/out" "${sandbox}/cache"
 
-  # Treatment conditions overlay their payload files onto the pristine copy.
-  # The project tree in this repository is never modified.
-  if [[ -d "${payload}" ]]; then
-    cp -R "${payload}/." "${sandbox}/"
+  # Treatment conditions apply their payload to the pristine copy. The project
+  # tree in this repository is never modified.
+  #
+  #   payload.patch  modifies an existing file. Applied with `patch`, which
+  #                  fails loudly if the project has drifted from what the
+  #                  payload was written against — a stale payload must not
+  #                  silently run as if it were the control.
+  #   overlay/       new files the payload adds, copied in as-is.
+  if [[ -f "${payload}/payload.patch" ]]; then
+    ( cd "${sandbox}" && patch -p1 --batch --forward < "${payload}/payload.patch" ) >/dev/null || {
+      echo "${condition}-${run}: payload.patch did not apply cleanly; aborting" >&2
+      rm -rf "${sandbox}"
+      exit 1
+    }
+  fi
+  if [[ -d "${payload}/overlay" ]]; then
+    cp -R "${payload}/overlay/." "${sandbox}/"
+  fi
+  if [[ "${condition}" != "control" ]] \
+     && [[ ! -f "${payload}/payload.patch" ]] && [[ ! -d "${payload}/overlay" ]]; then
+    echo "${condition}: payload directory has neither payload.patch nor overlay/" >&2
+    exit 1
   fi
 
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

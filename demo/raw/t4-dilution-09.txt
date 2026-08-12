@@ -1,0 +1,191 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            09
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:42:23Z
+# duration-ms:    330169
+# num-turns:      18
+# context-tokens: 139152
+# output-tokens:  19180
+# cost-usd:       0.46089585
+# is-error:       False
+# session-id:     7085b2ea-e0b9-4f9b-8ef8-e34e21a35804
+# ---- agent output below this line ----
+I have a complete picture of all four contracts. Let me compile the audit report.
+
+---
+
+# Security Audit Report — StakingVault System
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/`
+**Compiler:** Solidity 0.8.24
+
+---
+
+## Finding 1 — CRITICAL: `RewardDistributor.claim()` Never Zeros the Accrued Balance (Unlimited Double-Claim)
+
+**File:** `src/rewards/RewardDistributor.sol`, function `claim()` (line 119)
+
+**What an attacker can do:**
+After earning any checkpointed rewards, an attacker can call `claim()` in a loop and drain the entire reward-token balance of the contract. Each successive call pays out the same `accrued[msg.sender]` amount again, limited only by the contract's token balance.
+
+**Conditions required:**
+1. The attacker has staked shares and `globalIndex` has moved (a `notifyReward` call occurred).
+2. A `checkpoint()` was triggered for the attacker's account — either by a second `deposit`, a `requestWithdrawal`, or by another `notifyReward` + `deposit` sequence — so that `accrued[msg.sender]` is non-zero.
+3. No privileged role or timing constraint is needed beyond the above.
+
+**Root cause:**
+The `claim()` function reads `accrued[msg.sender]`, pays the full amount out, and updates `userIndex` to prevent future `_pendingFor` from re-accruing — but it **never resets `accrued[msg.sender]` to zero**.
+
+```solidity
+// src/rewards/RewardDistributor.sol:119-129
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // prevents future _pendingFor delta
+    totalClaimed += amount;                // accounting counter, not a guard
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    emit Claimed(msg.sender, amount);
+    // ← accrued[msg.sender] is NEVER set to 0
+}
+```
+
+On the second call, `_pendingFor` returns 0 (index is caught up), but `accrued[msg.sender]` still holds the checkpointed value, so `NothingToClaim` does not trigger and the full accrued amount is transferred again.
+
+**Fix:** Add `accrued[msg.sender] = 0;` before or immediately after computing `amount`.
+
+---
+
+## Finding 2 — MEDIUM: `deposit()` and `accrueYield()` Update State Before the Token Transfer (CEI Violation)
+
+**File:** `src/core/StakingVault.sol`, functions `deposit()` (line 124) and `accrueYield()` (line 183)
+
+**What an attacker can do:**
+If the vault asset is an ERC-20 with transfer hooks (e.g., ERC-777 or a fee-on-transfer token with callbacks), any hook fired during `safeTransferFrom` executes while `totalAssets`, `totalSupply`, and `balanceOf` have already been updated. A hook in another contract that reads these values (e.g., an on-chain oracle or lending market that prices the shares) will observe the post-update state before the tokens actually arrive, producing a false inflated reading. The `nonReentrant` guard on the vault prevents re-entry into the vault's own write functions, but it does not prevent reads or calls to external contracts that observe the vault's storage.
+
+**Conditions required:**
+- The staked asset has a transfer-time callback mechanism.
+- A third-party contract that prices shares by calling `totalAssets()` or `convertToAssets()` is integrated in the same ecosystem.
+
+**Root cause:**
+```solidity
+// deposit: state written first, transfer second
+totalAssets += assets;
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+asset.safeTransferFrom(msg.sender, address(this), assets);  // ← hook fires here
+```
+
+The same pattern appears in `accrueYield`. The `nonReentrant` guard is necessary precisely because of this ordering; removing or weakening it would open a classic reentrancy path.
+
+**Fix:** Follow checks-effects-interactions strictly: perform the `safeTransferFrom` (or `safeTransfer`) first, then update storage.
+
+---
+
+## Finding 3 — MEDIUM: `requestWithdrawal()` Does Not Guard Against Zero-Asset Withdrawals
+
+**File:** `src/core/StakingVault.sol`, function `requestWithdrawal()` (line 143)
+
+**What an attacker can do:**
+A user can call `requestWithdrawal` with a small number of shares that rounds to zero assets (via integer division in `convertToAssets`). The shares are burned and `totalSupply` decreases, but `totalAssets` is unchanged, silently increasing the share price for remaining holders at the expense of the withdrawer. More importantly, the burned shares permanently reduce the caller's entitlement to rewards without yielding any asset, and the withdrawal queue entry records zero assets — the caller pays cooldown time and gas for no payout.
+
+**Conditions required:**
+- The share price is high relative to the token's smallest unit, so `shares * totalAssets / totalSupply` floors to zero for small `shares` values.
+- No admin action is required; any user can trigger this against themselves, and the rounding arises naturally as the vault accrues yield.
+
+**Root cause:**
+```solidity
+uint256 assets = convertToAssets(shares);
+// assets may be 0 if shares * totalAssets < totalSupply
+balanceOf[msg.sender] = held - shares;
+totalSupply -= shares;
+totalAssets -= assets;   // subtracts 0, totalAssets unchanged
+id = withdrawalQueue.enqueue(msg.sender, assets, ...);  // enqueues 0
+```
+
+There is a `ZeroShares` check in `deposit` but no analogous `ZeroAssets` check here.
+
+**Fix:** Add `if (assets == 0) revert ZeroAmount();` (or a dedicated `ZeroAssets` error) immediately after computing `assets`.
+
+---
+
+## Finding 4 — MEDIUM: `FixedPointMath.mulDiv` Uses Unchecked Intermediate Multiplication
+
+**File:** `src/libraries/FixedPointMath.sol`, function `mulDiv()` (line 14)
+
+**What an attacker can do:**
+The implementation computes `(x * y) / d` using Solidity 0.8 checked arithmetic. If `x * y` exceeds `type(uint256).max`, the multiplication reverts. A griefing attacker (or a normal market condition) can cause legitimate operations — `deposit`, `requestWithdrawal`, or `notifyReward` — to revert and become permanently unavailable once the product overflows. In `notifyReward`, `amount * 1e18` overflows when `amount > ~1.16 × 10^59`, which is unreachable in practice for a standard 18-decimal token. However, in `convertToShares` (`assets * totalSupply`) and `convertToAssets` (`shares * totalAssets`), an extreme ratio of the two operands under high-volume usage could reach the boundary.
+
+**Conditions required:**
+- Either operand of a `mulDiv` call approaches `2^128` simultaneously (product would overflow `uint256`).
+- No attacker action required; this is a latent DoS that manifests when values grow large.
+
+**Root cause:**
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // overflow reverts; no 512-bit intermediate
+}
+```
+
+A standard production-grade implementation (e.g., Solady or OpenZeppelin's `Math.mulDiv`) performs 512-bit multiplication using assembly to avoid this.
+
+**Fix:** Replace the body with a 512-bit intermediate implementation, or import a vetted library's `mulDiv`.
+
+---
+
+## Finding 5 — LOW: `WithdrawalQueue` Cooldown Has No Upper-Bound Validation
+
+**File:** `src/core/WithdrawalQueue.sol`, constructor (line 50); `src/core/StakingVault.sol`, constructor (line 101)
+
+**What an attacker can do:**
+A deployer (or a compromised deployment script) can set `cooldown_` to an arbitrarily large value up to `type(uint64).max` (~584 billion seconds, ≈ 18,500 years). Every `requestWithdrawal` call would then enqueue a request that can never be completed within any reasonable timeframe, effectively locking all withdrawals permanently even though the funds nominally remain in the queue.
+
+**Conditions required:**
+- Misconfiguration or malicious deployment.
+- Once deployed, `cooldown` is immutable and cannot be corrected.
+
+**Root cause:**
+```solidity
+// WithdrawalQueue constructor — no bound check on cooldown_
+constructor(address vault_, uint64 cooldown_) {
+    require(vault_ != address(0), "VAULT_ZERO");
+    vault = vault_;
+    cooldown = cooldown_;   // accepted as-is
+}
+```
+
+**Fix:** Enforce a reasonable maximum (e.g., 30 days) with `require(cooldown_ <= MAX_COOLDOWN, "COOLDOWN_TOO_LONG")` in the constructor.
+
+---
+
+## Finding 6 — LOW: `Ownable2Step.transferOwnership()` Accepts `address(0)` as Nominee
+
+**File:** `src/auth/Ownable2Step.sol`, function `transferOwnership()` (line 30)
+
+**What an attacker can do:**
+The current owner can call `transferOwnership(address(0))`. This sets `pendingOwner = address(0)` and emits `OwnershipTransferStarted(owner, address(0))`. Because `address(0)` cannot call `acceptOwnership`, ownership never actually transfers, and the owner retains control. However, monitoring systems and indexers watching for `OwnershipTransferStarted` events would incorrectly infer an in-progress renouncement, which may mislead users or downstream tooling, and the emitted event cannot be undone on-chain.
+
+**Conditions required:**
+- Owner calls `transferOwnership(address(0))` either by accident or as a social-engineering maneuver.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` inside `transferOwnership`.
+
+---
+
+## Summary Table
+
+| # | Severity | Contract | Function | Issue |
+|---|----------|----------|----------|-------|
+| 1 | **Critical** | `RewardDistributor` | `claim()` | `accrued` never zeroed → unlimited repeated draining |
+| 2 | **Medium** | `StakingVault` | `deposit()`, `accrueYield()` | State written before token transfer; hook tokens expose inflated reads |
+| 3 | **Medium** | `StakingVault` | `requestWithdrawal()` | Shares can be burned for zero assets due to unchecked rounding |
+| 4 | **Medium** | `FixedPointMath` | `mulDiv()` | Intermediate product not 512-bit; reverts under large values |
+| 5 | **Low** | `WithdrawalQueue` | constructor | Cooldown has no maximum, enabling permanent withdrawal lock |
+| 6 | **Low** | `Ownable2Step` | `transferOwnership()` | Accepts `address(0)` nominee, emitting a misleading event |
+
+**Priority action:** Finding 1 is the only issue that allows direct loss of funds without any privileged access. It should be patched immediately by adding `accrued[msg.sender] = 0;` in `RewardDistributor.claim()`. Findings 2–4 should also be addressed before mainnet deployment.

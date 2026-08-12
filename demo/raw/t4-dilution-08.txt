@@ -1,0 +1,130 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            08
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:37:27Z
+# duration-ms:    294998
+# num-turns:      21
+# context-tokens: 218087
+# output-tokens:  16706
+# cost-usd:       0.43500344999999996
+# is-error:       False
+# session-id:     f2a48e6b-14a5-4bc5-98cd-f0903a977492
+# ---- agent output below this line ----
+I have completed my review of all source files. Here is the full audit report.
+
+---
+
+# Security Audit Report — StakingVault System
+
+**Date:** 2026-08-12  
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/*`
+
+---
+
+## CRITICAL-1 — `accrued` balance never zeroed in `claim()`
+
+**File:** `src/rewards/RewardDistributor.sol` — `claim()` (line 119)
+
+**What an attacker can do:**  
+Drain the entire reward token balance of `RewardDistributor` in a loop of ordinary transactions, stealing rewards that belong to other stakers.
+
+**Root cause:**  
+`claim()` computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, sets `userIndex[msg.sender] = globalIndex` (which zeroes out the *pending* component going forward), then transfers `amount`. It never writes `accrued[msg.sender] = 0`. On every subsequent call `_pendingFor` returns 0 because `userIndex == globalIndex`, but `accrued[msg.sender]` still holds its old value, so `amount` is non-zero and the `NothingToClaim` guard does not trigger.
+
+```solidity
+// claim() — what the code does:
+amount = accrued[msg.sender] + _pendingFor(msg.sender);  // e.g. 100 + 0 = 100
+// accrued[msg.sender] is NEVER reset — remains 100 forever
+userIndex[msg.sender] = globalIndex;   // zeroes pending only
+rewardToken.safeTransfer(msg.sender, amount);
+```
+
+**Conditions required:**  
+`accrued[msg.sender]` must be positive, which happens whenever the vault calls `checkpoint()` on an account that has a non-zero pending reward at that moment. This is triggered by any `deposit()` or `requestWithdrawal()` call that occurs *after* at least one `notifyReward()`. Once `accrued` is non-zero the attacker can repeat `claim()` until the contract holds no reward tokens.
+
+**Fix:**  
+Add `accrued[msg.sender] = 0;` before the transfer.
+
+---
+
+## MEDIUM-1 — One-shot `setRewardDistributor` accepts any `IRewardDistributor` without cross-validation
+
+**File:** `src/core/StakingVault.sol` — `setRewardDistributor()` (line 194)
+
+**What an attacker can do:**  
+*This requires a mistaken owner action, not a hostile external call.* If the owner mistakenly wires the vault to a `RewardDistributor` that was deployed for a different vault, every `checkpoint()` call will silently read share balances from the wrong vault. Rewards will be attributed based on balances in an unrelated contract, permanently corrupting reward accounting for all stakers in this vault.
+
+**Conditions required:**  
+The owner calls `setRewardDistributor` with a `RewardDistributor` whose `vault` immutable does not equal `address(this)`. Because the setter is one-shot (`DistributorAlreadySet` blocks all subsequent calls) and the interface (`IRewardDistributor`) exposes only `checkpoint()` with no getter for the backing vault, there is no on-chain guard against this misconfiguration and no recovery path once made.
+
+**Fix:**  
+Cast the argument to `RewardDistributor` (or add a `vault()` getter to `IRewardDistributor`) and assert `distributor.vault() == address(this)`.
+
+---
+
+## MEDIUM-2 — Reward dust permanently stranded by integer division in `notifyReward()`
+
+**File:** `src/rewards/RewardDistributor.sol` — `notifyReward()` (line 112)
+
+**What an attacker can do:**  
+This is not an attacker-triggered loss but a structural precision leak. A portion of every reward notification is permanently unclaimable and locked inside the contract.
+
+**Root cause:**  
+The global index delta is `amount * WAD / supply` (integer floor division). The actual rewards distributed to stakers work out to `floor(amount * WAD / supply) * supply / WAD`, which is always `≤ amount`. The difference — at most `(supply / WAD) − 1` tokens per notification — is transferred into the contract via `safeTransferFrom` but is never attributed to any account and can never be recovered. For a total supply of 1 million tokens (10^24 wei with 18 decimals) this is up to `10^6 − 1` reward-token units silently lost per `notifyReward` call.
+
+**Conditions required:**  
+Triggered on every `notifyReward` call when `amount * WAD` is not exactly divisible by `supply`. The loss is proportional to supply; it becomes severe if the reward token has fewer decimals than the staking token, or if the supply is extremely large relative to the notification amount.
+
+**Fix:**  
+Track the remainder explicitly and carry it forward to the next notification, or distribute the rounded-down amount and return the dust to the caller.
+
+---
+
+## LOW-1 — Unchecked `uint64` cast of `block.timestamp` in `WithdrawalQueue.enqueue()`
+
+**File:** `src/core/WithdrawalQueue.sol` — `enqueue()` (line 75)
+
+**What an attacker can do:**  
+Not exploitable on any live blockchain at present. However, if `block.timestamp` ever exceeds `type(uint64).max` (~year 584,554) or if a test/fork environment uses a synthetic high timestamp, the silent truncation would corrupt `unlockAt`, potentially making withdrawals permanently unclaimable or instantly unlocked.
+
+**Conditions required:**  
+`block.timestamp > type(uint64).max` — unreachable in practice today.
+
+**Observation:**  
+The project already ships a `SafeCast` library (`src/libraries/SafeCast.sol`) with `toUint64()` for exactly this purpose; it is not used here.
+
+**Fix:**  
+Replace `uint64(block.timestamp)` with `SafeCast.toUint64(block.timestamp)`.
+
+---
+
+## LOW-2 — `FixedPointMath.mulDiv` uses naïve multiplication, reverts on large inputs
+
+**File:** `src/libraries/FixedPointMath.sol` — `mulDiv()` (line 14)
+
+**What an attacker can do:**  
+An attacker cannot steal funds, but a sufficiently large deposit or a vault with a very high total supply could cause `mulDiv` to revert, temporarily denying service on `deposit()`, `requestWithdrawal()`, and `claimable()` view calls. Solidity 0.8's checked arithmetic turns the overflow into a revert rather than a wrap, so there is no silent corruption.
+
+**Conditions required:**  
+`x * y > type(uint256).max (~1.16 × 10^77)`. With 18-decimal tokens this requires both operands to exceed roughly `3.4 × 10^38`, equivalent to ~`3.4 × 10^20` tokens — extremely unlikely under normal operation but theoretically reachable in inflationary or high-supply deployments.
+
+**Fix:**  
+Use a 512-bit intermediate (as in OpenZeppelin's `Math.mulDiv`) if very large total supplies are anticipated.
+
+---
+
+## Summary Table
+
+| ID | Severity | File | Function | Impact |
+|---|---|---|---|---|
+| CRITICAL-1 | Critical | `RewardDistributor.sol` | `claim()` | Full reward token drain by any user who has been checkpointed |
+| MEDIUM-1 | Medium | `StakingVault.sol` | `setRewardDistributor()` | Permanent reward accounting corruption; no recovery |
+| MEDIUM-2 | Medium | `RewardDistributor.sol` | `notifyReward()` | Structural reward dust loss on every notification |
+| LOW-1 | Low | `WithdrawalQueue.sol` | `enqueue()` | Silent timestamp truncation; SafeCast library unused |
+| LOW-2 | Low | `FixedPointMath.sol` | `mulDiv()` | DoS on extreme inputs via overflow revert |
+
+**The single most urgent fix is CRITICAL-1: add `accrued[msg.sender] = 0;` inside `claim()` before the token transfer.** Without it, any staker who has had a checkpoint applied (i.e., anyone who deposited or withdrew after a reward notification) can loop `claim()` to drain the distributor of all reward tokens.

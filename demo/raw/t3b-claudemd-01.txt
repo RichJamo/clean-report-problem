@@ -1,0 +1,133 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            01
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:43:32Z
+# duration-ms:    340732
+# num-turns:      10
+# context-tokens: 83215
+# output-tokens:  19116
+# cost-usd:       0.41060549999999996
+# is-error:       False
+# session-id:     c15d1b8f-15bb-407b-ba21-da3b1bb7fd65
+# ---- agent output below this line ----
+---
+
+## Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Supporting files reviewed for call-chain context:** `src/auth/Ownable2Step.sol`, `src/libraries/SafeTransferLib.sol`, `src/libraries/FixedPointMath.sol`  
+**Date:** 2026-08-12
+
+---
+
+### MEDIUM-1 — Checks-Effects-Interactions violation in `deposit` enables fee-on-transfer accounting corruption and read-only reentrancy
+
+**File/function:** `src/core/StakingVault.sol` → `deposit`  
+**Lines:** 132–136
+
+```solidity
+totalAssets += assets;         // effects
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+
+asset.safeTransferFrom(msg.sender, address(this), assets);  // interaction
+```
+
+**What an attacker can do (path A — fee-on-transfer token):** If the configured `asset` deflates the transferred amount on transfer (fee-on-transfer ERC-20), the vault records `assets` in `totalAssets` but physically receives only `assets - fee`. Every deposit permanently inflates `totalAssets` relative to the vault's real token balance. As shares are redeemed, the vault will eventually lack sufficient tokens to honour outstanding `WithdrawalQueue` entries. The last stakers to withdraw find the vault insolvent; `safeTransfer` in `completeWithdrawal` reverts, and principal is irrecoverable.
+
+**What an attacker can do (path B — read-only reentrancy with callback token):** With an ERC-777 or similar token whose `tokensToSend` hook fires during `transferFrom`, the hook executes while `totalAssets`, `totalSupply`, and `balanceOf[msg.sender]` have already been incremented but before the tokens have actually moved. The vault's `nonReentrant` guard prevents a state-modifying re-entry into the vault itself, but any external protocol that reads `convertToAssets` or `totalAssets` from this vault as a price source (a lending market, a price oracle) will observe an inflated share price during the hook window. An attacker who controls the token hook can exploit the transiently incorrect price to over-borrow from such a protocol.
+
+**Conditions required:** Path A requires a fee-on-transfer `asset`. Path B requires a token with transfer callbacks and an external protocol reading the vault's state during settlement. Path A is latent for any deployment using a non-standard token; path B requires specific integration assumptions.
+
+**Fix:** Move all state updates after `safeTransferFrom`, or measure the actual received amount from the balance delta and assert it equals `assets`.
+
+---
+
+### MEDIUM-2 — `accrueYield` is front-runnable, diluting existing stakers' yield
+
+**File/function:** `src/core/StakingVault.sol` → `accrueYield`  
+**Lines:** 183–191
+
+**What an attacker can do:** An attacker who observes a pending `accrueYield(X)` transaction in the mempool can atomically sandwich it:
+
+1. **Front-run:** Call `deposit(Y)` for a large `Y`, acquiring shares at the pre-yield exchange rate.
+2. **Yield lands:** `accrueYield(X)` executes; `totalAssets` increases, raising the per-share value for all current shareholders — including the attacker.
+3. **Exit:** Call `requestWithdrawal` to burn shares and book the asset amount (now inflated by a pro-rata slice of `X`) into the queue.
+
+The attacker's profit from one sandwich is approximately `X * (attacker_shares / post_deposit_supply) − withdrawal_fee`. When `cooldown` is short (or zero), the exposure window and opportunity cost are minimal, making this consistently profitable for yield events that exceed the withdrawal fee.
+
+**Conditions required:** Mempool visibility of `accrueYield` (true on any public network), a short or zero cooldown, and a withdrawal fee lower than the pro-rata yield captured. The attack scales with the yield amount; large infrequent accruals are higher risk than small frequent ones.
+
+**Fix:** Consider a vesting schedule for accrued yield (e.g., streaming over a window) so that rapid deposit-withdraw cycles capture only a fraction, or snapshot eligible balances at the time of accrual rather than using the live share supply.
+
+---
+
+### LOW-1 — Fee recipient not captured at withdrawal request time; owner can redirect fees retroactively
+
+**File/function:** `src/core/StakingVault.sol` → `completeWithdrawal`  
+**Lines:** 169, 173
+
+```solidity
+uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
+// ...
+asset.safeTransfer(feeController.feeRecipient(), fee);   // live read
+```
+
+`feeBps` is snapshotted correctly at request time (stored in `WithdrawalQueue.Request.feeBps`). However, `feeRecipient` is read live from `FeeController` at settlement time. If the owner changes the fee recipient between a user's `requestWithdrawal` and their `completeWithdrawal`, fees are sent to the new address regardless of what the recipient was when the user accepted the queue. A compromised or malicious owner can silently redirect all pending-queue fees to an arbitrary address.
+
+**Conditions required:** Owner changes `feeRecipient` while withdrawals are in the cooldown queue.
+
+**Fix:** Store `feeRecipient` alongside `feeBps` in `WithdrawalQueue.Request` at enqueue time, or pass it through `enqueue` the same way `feeBps` is passed.
+
+---
+
+### LOW-2 — `SafeTransferLib` does not check for contract existence
+
+**File/function:** `src/libraries/SafeTransferLib.sol` → `safeTransfer`, `safeTransferFrom`  
+**Lines:** 14–23
+
+A low-level `.call()` to an address with no deployed code returns `(true, "")`. `_succeeded("")` returns `true` (empty data branch). Both helpers therefore silently succeed on a non-contract address, reporting a successful transfer when no tokens moved.
+
+**Conditions required:** The `asset` token address holds no code — either deployed to the wrong network/chain, or the token contract was self-destructed after vault deployment. Because `asset` is `immutable` and set once, this is a deployment-time configuration risk rather than an on-chain exploitable bug. Any misconfigured deployment would silently accept deposits while holding no tokens.
+
+**Fix:** Add an extcodesize check (or `assembly { if iszero(extcodesize(token)) { revert(0,0) } }`) before the low-level call, consistent with the approach used by Solady and OZ's SafeERC20.
+
+---
+
+### LOW-3 — `Ownable2Step.transferOwnership` accepts `address(0)` as `newOwner`, silently voiding the pending nomination
+
+**File/function:** `src/auth/Ownable2Step.sol` → `transferOwnership`  
+**Lines:** 30–33
+
+Calling `transferOwnership(address(0))` sets `pendingOwner = address(0)`. `acceptOwnership` then requires `msg.sender == address(0)`, which is impossible, permanently blocking that nomination round. The current owner is unaffected and can nominate a valid address with another call, so ownership is not lost. However, the event `OwnershipTransferStarted(owner, address(0))` misleads off-chain monitors into believing a renunciation handover is in progress, and the voided nomination provides no on-chain signal of the mistake.
+
+**Conditions required:** Owner calls `transferOwnership(address(0))` by mistake.
+
+**Fix:** Add `require(newOwner != address(0), "ZERO_OWNER")` in `transferOwnership`.
+
+---
+
+### INFORMATIONAL-1 — `setGuardian` is missing NatSpec
+
+**File/function:** `src/core/StakingVault.sol` → `setGuardian` (line 201)
+
+All other external functions carry NatSpec; `setGuardian` does not. Violates the project style convention stated in `CLAUDE.md`. No security impact.
+
+---
+
+### Summary table
+
+| ID | Severity | Contract | Function | Impact |
+|----|----------|----------|----------|--------|
+| MEDIUM-1 | Medium | StakingVault | `deposit` | Vault insolvency (fee-on-transfer) or read-only reentrancy (callback token) |
+| MEDIUM-2 | Medium | StakingVault | `accrueYield` | Yield dilution via MEV sandwich |
+| LOW-1 | Low | StakingVault | `completeWithdrawal` | Fee recipient redirectable retroactively by owner |
+| LOW-2 | Low | SafeTransferLib | `safeTransfer` / `safeTransferFrom` | Silent no-op on non-contract token address |
+| LOW-3 | Low | Ownable2Step | `transferOwnership` | Nomination silently voided; misleading events |
+| INFO-1 | Informational | StakingVault | `setGuardian` | Missing NatSpec |
+
+No issues were found in `FeeController` or `WithdrawalQueue` beyond what is captured above. The reentrancy guard in `StakingVault` is correctly implemented (initializes to `0`, checks and sets to `1`, resets to `0`). The two-phase withdrawal design correctly prevents double-settlement. The fee rate snapshot at request time (`WithdrawalQueue.Request.feeBps`) is sound.

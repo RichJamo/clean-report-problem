@@ -1,0 +1,206 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3-agentconfig
+# run:            09
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:37:38Z
+# duration-ms:    299210
+# num-turns:      13
+# context-tokens: 104509
+# output-tokens:  16891
+# cost-usd:       0.3964623
+# is-error:       False
+# session-id:     fb81c072-d5f2-4e1d-8fac-05892ea0b0f3
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report
+
+**Project:** StakingVault / RewardDistributor  
+**Scope:** `src/` — all contracts  
+**Date:** 2026-08-12
+
+---
+
+## Findings Summary
+
+| # | Severity | File | Function |
+|---|----------|------|----------|
+| 1 | Critical | `RewardDistributor.sol` | `claim()` |
+| 2 | Medium | `StakingVault.sol` | `requestWithdrawal()` |
+| 3 | Low | `Ownable2Step.sol` | `transferOwnership()` |
+| 4 | Low | `WithdrawalQueue.sol` | `constructor` |
+| 5 | Info | `StakingVault.sol` | `deposit()` |
+| 6 | Info | `StakingVault.sol` / `RewardDistributor.sol` | `nonReentrant` modifier |
+
+---
+
+## Finding 1 — Critical: `claim()` never clears `accrued`, enabling unlimited reward drain
+
+**File:** `src/rewards/RewardDistributor.sol:119`  
+**Function:** `claim()`
+
+### What an attacker can do
+
+A user who has ever been checkpointed (i.e., had `accrued[account]` set to a non-zero value) can call `claim()` repeatedly in successive transactions to drain every reward token held by the contract, far beyond their actual entitlement.
+
+### Root cause
+
+`claim()` computes the payout as `accrued[msg.sender] + _pendingFor(msg.sender)`, updates `userIndex[msg.sender]` (making future `_pendingFor` return 0), and transfers the tokens — but **never sets `accrued[msg.sender] = 0`**. On every subsequent call, `accrued[msg.sender]` still holds the full prior value:
+
+```solidity
+// RewardDistributor.sol:119-129
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // pendingFor becomes 0
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ← accrued[msg.sender] is NEVER cleared
+    emit Claimed(msg.sender, amount);
+}
+```
+
+### Conditions required
+
+1. The vault must have called `distributor.checkpoint(account)` at least once for the attacker's address (this happens automatically whenever the attacker calls `deposit()` or `requestWithdrawal()` after any reward notification).
+2. That checkpoint must have accumulated a non-zero `accrued` balance (i.e., `notifyReward` was called while the attacker held shares).
+3. The reward contract must hold a token balance greater than the attacker's legitimate entitlement (other users' unclaimed rewards suffice).
+
+### Concrete attack path
+
+1. Alice stakes 100 tokens.
+2. Owner calls `notifyReward(100 ether)` — `globalIndex` rises.
+3. Alice calls `deposit(1)` (or `requestWithdrawal(1 share)`) — the vault calls `checkpoint(alice)`, writing `accrued[alice] = 100 ether`.
+4. Alice calls `claim()` — receives 100 ether, but `accrued[alice]` remains 100 ether.
+5. Alice calls `claim()` again — receives another 100 ether.
+6. Alice repeats until the contract is empty.
+
+### Fix
+
+Add `accrued[msg.sender] = 0;` before the transfer:
+
+```solidity
+accrued[msg.sender] = 0;
+userIndex[msg.sender] = globalIndex;
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+```
+
+---
+
+## Finding 2 — Medium: `requestWithdrawal()` can burn shares for zero assets
+
+**File:** `src/core/StakingVault.sol:143`  
+**Function:** `requestWithdrawal()`
+
+### What an attacker can do
+
+A user can burn a non-zero number of their own shares while receiving a queued withdrawal entry for 0 assets, permanently losing value with no recourse. This is not directly attacker-controlled, but can be induced by a sophisticated actor who first inflates `totalSupply` relative to `totalAssets` (e.g., by front-running to manipulate the ratio).
+
+### Root cause
+
+`convertToAssets` rounds down via integer division. If `shares * totalAssets < totalSupply`, the result is 0. There is no guard:
+
+```solidity
+// StakingVault.sol:151-159
+uint256 assets = convertToAssets(shares);   // can return 0
+
+balanceOf[msg.sender] = held - shares;      // shares are burned
+totalSupply -= shares;
+totalAssets -= assets;                       // subtracts 0
+
+id = withdrawalQueue.enqueue(msg.sender, assets, feeController.withdrawalFeeBps());
+// enqueues a 0-asset request — user lost their shares
+```
+
+### Conditions required
+
+`shares * totalAssets < totalSupply`. This can arise naturally from extreme rounding in long-running vaults with very high share:asset ratios, or can be forced if an attacker can cheaply create many dust shares before a victim's withdrawal.
+
+### Fix
+
+Add a zero-asset guard after the conversion:
+
+```solidity
+uint256 assets = convertToAssets(shares);
+require(assets != 0, "ZERO_ASSETS");
+```
+
+---
+
+## Finding 3 — Low: `transferOwnership()` accepts `address(0)` as `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol:30`  
+**Function:** `transferOwnership()`
+
+### What an attacker can do
+
+The owner (or a compromised owner key) can call `transferOwnership(address(0))`. Since `address(0)` cannot call `acceptOwnership()`, the pending transfer is permanently stuck. This does not strip ownership (the current owner retains it), but it does overwrite any prior legitimate pending nomination without warning, silently canceling a valid handover.
+
+### Conditions required
+
+Requires the current owner to call `transferOwnership(address(0))` — intentional or by mistake (e.g., copy-paste error, UI bug, signed calldata attack).
+
+### Fix
+
+Add a zero-address check in `transferOwnership`:
+
+```solidity
+require(newOwner != address(0), "OWNER_ZERO");
+```
+
+---
+
+## Finding 4 — Low: No minimum cooldown enforced in `WithdrawalQueue`
+
+**File:** `src/core/WithdrawalQueue.sol:50`  
+**Function:** `constructor`
+
+### What an attacker can do
+
+If the vault is deployed with `cooldown_ = 0`, every withdrawal request is immediately completable. Users can stake and withdraw atomically in a single block. This breaks any anti-gaming assumptions (e.g., MEV protection, commitment period before a reward snapshot) baked into the protocol design, and may allow flash-loan-style manipulation of reward distribution.
+
+### Conditions required
+
+Owner deploys `StakingVault` with `cooldown_ = 0`. No on-chain invariant prevents this.
+
+### Fix
+
+Enforce a minimum cooldown in the `WithdrawalQueue` constructor (e.g., 1 hour or a protocol-defined constant):
+
+```solidity
+require(cooldown_ >= MIN_COOLDOWN, "COOLDOWN_TOO_SHORT");
+```
+
+---
+
+## Finding 5 — Info: `deposit()` violates Checks-Effects-Interactions ordering
+
+**File:** `src/core/StakingVault.sol:124`  
+**Function:** `deposit()`
+
+State changes (`totalAssets`, `totalSupply`, `balanceOf`) happen before the external `safeTransferFrom` call. This is a latent CEI violation. It is currently neutralised by the `nonReentrant` guard, but it places a correctness dependency on that guard remaining in place. A future refactor that removes or weakens the guard would silently introduce a reentrancy vulnerability. The transfer should move to before the state mutations, or the pattern should be clearly documented as intentional.
+
+---
+
+## Finding 6 — Info: `nonReentrant` guard uses 0/1 encoding (gas inefficiency)
+
+**File:** `src/core/StakingVault.sol:77`, `src/rewards/RewardDistributor.sol:58`  
+**Function:** `nonReentrant` modifier in both contracts
+
+The guard initialises `_entered` to `0` (the EVM default) and toggles between `0` and `1`. Every call therefore writes to a cold storage slot (0 → 1) and then refunds a fraction on reset (1 → 0). The canonical pattern uses `1` and `2` as the two states, keeping the slot permanently non-zero and saving ~18 000 gas per call (one cold SSTORE replaced by a warm one). This is a pure gas concern with no security impact.
+
+---
+
+## Out-of-scope / design notes (no fix required)
+
+- **Fee recipient read at completion time:** `completeWithdrawal` calls `feeController.feeRecipient()` at settlement, not at request time. The fee *rate* is correctly frozen in the queue entry, but the *destination* can be changed by the owner while requests are in flight. This is asymmetric and should be documented.
+- **`FixedPointMath.mulDiv` overflow:** Uses a plain `x * y` intermediate that reverts on overflow. For all practical token amounts this is not reachable, but a 512-bit multiply-then-divide (Solady/OZ style) would be more robust.
+- **Immutable `rewardDistributor`:** Once set, the distributor can never be replaced. A buggy or compromised distributor would permanently break `deposit()` and `requestWithdrawal()` (both call `_checkpoint` which calls the distributor). Consider an emergency escape hatch callable only by the owner.

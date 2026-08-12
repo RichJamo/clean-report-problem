@@ -1,0 +1,6 @@
+{
+  "StakingVault": "0xa98ef9cf4f55ae176ac5fda21af6ee62472809b7",
+  "FeeController": "0x945c4e1132a373e9722eece5a7bb2721e692e635",
+  "WithdrawalQueue": "0x74226327a699fddeed871bc4e2ea1b6a1df4d589",
+  "RewardDistributor": "0xd99e2a3bb952ce0648c53ca1fa056fd3cba98869"
+}

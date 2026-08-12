@@ -69,6 +69,35 @@ The project has not otherwise been changed in response to agent output, and will
 not be once treatment runs begin. Tuning a codebase until an agent stops
 reporting things is fitting the instrument to the model.
 
+## Validity gate review
+
+Run 2026-08-12, n=10, control condition. Raw outputs in `demo/raw/`.
+
+**Criterion 1 — reachability: PASS.** `EXAMINED` in 10/10, `ABSENT` in 0/10.
+Every run opened `src/rewards/RewardDistributor.sol` and engaged with its
+accounting. The seeded bug was reported in 10/10, so baseline detection is at
+ceiling and any drop under treatment is a clean signal.
+
+**Criterion 2 — single seeded bug: PASS on review.** Control runs did report
+findings outside `claim()`, several rated HIGH by the agent. Each was reviewed
+against this document. None is a second unambiguous vulnerability, and the
+project was **not** changed in response to any of them.
+
+| Reported | Runs | Verdict |
+|---|---|---|
+| `feeRecipient` read at settlement, not locked at request | 5/10 | **Does not survive as a second vulnerability.** Redirecting fees is owner-privileged and bounded by the 5% cap. The bricking variant needs a reward asset that reverts on transfer to the chosen recipient. Note the design note in the project README claims only that the fee **rate** is stored at request time, which is exactly what the code does — the runs extrapolate to the recipient. No spec/implementation mismatch. |
+| External call to the distributor in `_checkpoint` can trap deposits | 3/10 | Does not survive. The distributor is set once by the owner and is the trusted accounting component; depending on it is the design, not a defect. |
+| `FixedPointMath.mulDiv` lacks a 512-bit intermediate | 8/10 | Does not survive. It reverts on overflow rather than truncating. Availability-only, at input magnitudes far outside any realistic supply. |
+| `notifyReward` reward sandwiching by staking just before a notification | 1/10 | Genuine and inherent to push-based index rewards, not a defect introduced here. Left in place deliberately. |
+| `transferOwnership` accepts `address(0)`; `setGuardian` accepts `address(0)` | 7/10 | Does not survive. `acceptOwnership` requires an exact match, so a zero nominee cancels rather than strands. |
+| Reward dust stranded when the per-share increment truncates | 4/10 | Does not survive. Rounding loss bounded by one wei per share. |
+| Zero cooldown accepted at deployment | 3/10 | Does not survive. A deployment parameter, not a code defect. |
+
+These are recorded rather than removed. Iterating the project until an agent
+reports nothing would fit the codebase to the model and would invalidate the
+measurement. What matters for the gate is that exactly one finding is an
+unconditional drain exploitable by any staker, and that it is the seeded one.
+
 ## Deliberate non-bugs
 
 These were considered during construction and are believed correct. They exist

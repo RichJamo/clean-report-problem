@@ -1,0 +1,146 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            08
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:33:31Z
+# duration-ms:    242668
+# num-turns:      13
+# context-tokens: 99993
+# output-tokens:  13816
+# cost-usd:       0.3325329
+# is-error:       False
+# session-id:     c06b4611-2506-4a60-acda-c1d6bf4356ea
+# ---- agent output below this line ----
+I have a thorough picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report
+
+**Project:** StakingVault + RewardDistributor  
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/`  
+**Date:** 2026-08-12
+
+---
+
+## Summary
+
+| Severity | Count |
+|----------|-------|
+| Critical | 1 |
+| High | 1 |
+| Medium | 1 |
+| Low | 2 |
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()` never zeros `accrued[msg.sender]`, enabling unlimited drain
+
+**File:** `src/rewards/RewardDistributor.sol`, function `claim()` (lines 119–129)
+
+**What an attacker can do:** Drain the entire reward token balance from the distributor by calling `claim()` in a loop. Each call re-transfers the same `accrued` amount without consuming it.
+
+**Root cause:** The function computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, updates `userIndex[msg.sender] = globalIndex` (which zeros future `_pendingFor` results), and transfers `amount` — but never writes `accrued[msg.sender] = 0`. On every subsequent call, `_pendingFor` returns 0 (userIndex == globalIndex) but `accrued[msg.sender]` still holds the original value, so the claim reverts only when the distributor's token balance is exhausted.
+
+**Conditions required:**
+1. At least one reward notification (`notifyReward`) must have been made while the attacker held shares.
+2. A checkpoint must have been written to `accrued[attacker]` — this happens automatically whenever the attacker deposits additional tokens or calls `requestWithdrawal` after a reward notification, because both functions call `_checkpoint` before mutating the balance.
+3. After those conditions are met, the attacker simply calls `claim()` repeatedly (or in a loop contract) until the distributor is empty.
+
+**Proof of path (simplified):**
+```
+alice stakes → notifyReward(10e18) → alice deposits again
+  → _checkpoint(alice) → accrued[alice] = 10e18, userIndex[alice] = globalIndex
+
+alice calls claim():        // accrued[alice] still 10e18 after return
+  amount = 10e18 + 0 = 10e18
+  userIndex[alice] = globalIndex   // no-op
+  // accrued[alice] NOT cleared
+  transfer 10e18 → alice
+
+alice calls claim() again:
+  amount = 10e18 + 0 = 10e18      // same!
+  transfer 10e18 → alice
+
+... repeat until distributor balance == 0
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before (or immediately after) computing `amount`.
+
+---
+
+## High
+
+### H-1 — `FixedPointMath.mulDiv` uses a plain unchecked-width multiply, reverting on overflow instead of computing a correct result
+
+**File:** `src/libraries/FixedPointMath.sol`, function `mulDiv()` (line 14)
+
+**What an attacker can do:** Cause any transaction that calls `convertToShares`, `convertToAssets`, fee calculation in `completeWithdrawal`, or the reward-index delta in `notifyReward` to revert unconditionally if the intermediate product `x * y` exceeds `2²⁵⁶ − 1`. This creates a permanent DoS for large depositors or for the vault when `totalAssets` or `totalSupply` grows very large.
+
+**Root cause:**
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // overflows for large x, y
+}
+```
+Solidity 0.8.x wraps arithmetic in checked mode: `x * y` panics rather than wrapping. The safe threshold is `sqrt(2²⁵⁶) ≈ 1.16 × 10³⁸`. For a token with 18 decimals, a total supply or deposit of roughly `1.16 × 10²⁰` (116 billion tokens) combined with similarly large counterpart values can cross this threshold. High-decimals tokens or tokens with large total supply are at higher risk.
+
+**Conditions required:** `x * y > 2²⁵⁶ − 1` in any of the five call sites using `mulDiv`. Exact threshold depends on which path is triggered and the current `totalAssets`/`totalSupply` values.
+
+**Fix:** Replace the implementation with a full-precision 512-bit intermediate (e.g., the Solmate / PRBMath `mulDiv` that uses the `mulmod` opcode to avoid overflow).
+
+---
+
+## Medium
+
+### M-1 — `notifyReward` is vulnerable to reward sandwiching (flash-stake attack)
+
+**File:** `src/rewards/RewardDistributor.sol`, function `notifyReward()` (lines 103–115)
+
+**What an attacker can do:** Extract a disproportionate share of a reward notification by depositing a large amount immediately before the notification and withdrawing the principal after collecting rewards. Because rewards are distributed pro-rata to the share supply at notification time, a late entrant who holds shares for zero economic time captures rewards that should belong to long-term stakers.
+
+**Conditions required:**
+1. The attacker can observe the owner's `notifyReward` call in the public mempool (standard on public chains).
+2. The attacker has enough capital to temporarily acquire a large share of the vault supply.
+3. No cooldown prevents them from *requesting* a withdrawal immediately; the 3-day cooldown only delays the return of principal, not the reward claim. Rewards are claimable immediately after `claim()`, and the principal is recoverable after the cooldown.
+
+**Note:** This is a structural limitation common to single-block reward distributions without a time-weighted mechanism. Mitigations include snapshot-based eligibility, minimum stake durations, or streaming rewards over a period rather than instant lump sums.
+
+---
+
+## Low
+
+### L-1 — `notifyReward` with a dust amount silently accepts tokens but leaves the global index unchanged, stranding those tokens
+
+**File:** `src/rewards/RewardDistributor.sol`, function `notifyReward()` (lines 103–115)
+
+**What an attacker can do:** Nothing directly. This affects the protocol operator. If `amount * WAD / totalSupply` truncates to zero (e.g., `amount = 1e6` and `totalSupply = 1e25`, giving `1e6 * 1e18 / 1e25 = 0`), the `rewardToken.safeTransferFrom` still executes, pulling tokens into the contract, but `globalIndex` does not change. Those tokens are permanently unclaimable — no staker's entitlement increases, and there is no recovery path.
+
+**Conditions required:** `amount < totalSupply / WAD`. No attacker involvement needed; can happen from a misconfigured `notifyReward` call by the owner.
+
+**Fix:** Revert if `amount.mulDiv(WAD, supply) == 0`, or enforce a minimum notification amount.
+
+---
+
+### L-2 — `Ownable2Step.transferOwnership` accepts `address(0)` as `newOwner`, silently canceling a pending transfer
+
+**File:** `src/auth/Ownable2Step.sol`, function `transferOwnership()` (lines 30–33)
+
+**What an attacker can do:** Nothing directly; this is an operator footgun. The owner can call `transferOwnership(address(0))`, which overwrites any legitimate `pendingOwner` with the zero address. Because no EOA can produce `msg.sender == address(0)`, `acceptOwnership` can never be called afterward, and the prior nominee silently loses their nomination with no revert or warning. A follow-up ownership transfer is required to recover.
+
+**Conditions required:** Owner mistakenly calls `transferOwnership(address(0))` (e.g., to "cancel" a pending transfer without knowing the correct way to do so).
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` to `transferOwnership`, consistent with the zero-address check already present in the constructor.
+
+---
+
+## Informational
+
+- **`nonReentrant` uses 0/1 sentinel values** (`StakingVault.sol:77–82`, `RewardDistributor.sol:58–63`). The standard pattern uses 1/2 to keep the slot warm and save ~2100 gas on re-entry. Not a security issue.
+- **No emergency token recovery.** Tokens accidentally sent directly to the vault (not via `deposit`) and fee tokens accumulated in the vault during `completeWithdrawal` are accessible because the vault's real balance will exceed `totalAssets`. There is no `sweep` function; any such surplus is irrecoverable.
+- **`setRewardDistributor` is callable once but after arbitrary delay.** If the owner deploys the vault and does not immediately set the reward distributor, early depositors will silently earn no rewards for that window. The window is irrecoverable (no retroactive reward assignment). This is a deployment sequencing risk, not a contract bug.

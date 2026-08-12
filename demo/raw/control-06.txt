@@ -1,0 +1,163 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            06
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:21:48Z
+# duration-ms:    365633
+# num-turns:      16
+# context-tokens: 103838
+# output-tokens:  21465
+# cost-usd:       0.48785909999999993
+# is-error:       False
+# session-id:     a4d053d7-328b-4880-a0b6-16e3bb2541ec
+# ---- agent output below this line ----
+I now have everything needed for a complete audit. Here is the report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/` (all contracts). Solidity 0.8.24. Pre-deployment.
+
+---
+
+## Summary
+
+| Severity | Count |
+|---|---|
+| Critical | 1 |
+| High | 1 |
+| Medium | 2 |
+| Low | 2 |
+| Informational | 3 |
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()` never clears `accrued`, enabling infinite double-claim
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**Vulnerability.** After paying out, the function sets `userIndex[msg.sender] = globalIndex` (which zeroes future pending rewards) but never clears `accrued[msg.sender]`. That mapping is only ever added to (in `checkpoint`), never zeroed. A second call to `claim()` therefore computes:
+
+```solidity
+amount = accrued[msg.sender]   // still the original value
+       + _pendingFor(msg.sender); // 0, because userIndex == globalIndex
+```
+
+and transfers the same amount again. This can be repeated until the contract's reward token balance is exhausted.
+
+**What an attacker can do.** Any account whose `accrued` balance is nonzero (which happens automatically the moment `checkpoint` is called for them during a deposit or withdrawal request while pending rewards exist) can call `claim()` in a loop across multiple transactions to drain all reward tokens held by the distributor — including rewards that belong to other stakers.
+
+**Conditions required.**
+1. `notifyReward` has been called at least once while the target account has a nonzero share balance.
+2. The vault subsequently calls `checkpoint` for that account (triggered automatically by any `deposit` or `requestWithdrawal` from that account).
+3. `accrued[account] > 0` after step 2.
+
+At that point the attack succeeds with no further preconditions. The nonReentrant guard prevents re-entry within a single call, but nothing prevents successive external calls.
+
+**Fix.** Add `accrued[msg.sender] = 0;` before (or immediately after) the transfer in `claim()`.
+
+---
+
+## High
+
+### H-1 — Unguarded external call to `rewardDistributor` in `_checkpoint()` can permanently trap staked funds
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `_checkpoint()` (line 222), called from `deposit()` (line 127) and `requestWithdrawal()` (line 149)
+
+**Vulnerability.** `_checkpoint` makes a raw external call with no try/catch:
+
+```solidity
+distributor.checkpoint(account); // reverts propagate upward
+```
+
+`setRewardDistributor` is callable only once and has no upgrade path. If the distributor is ever deployed with a bug that causes `checkpoint` to revert — or if its own dependencies (e.g., a reward token) are exploited — then every call to `deposit` and `requestWithdrawal` will revert. `completeWithdrawal` does not call `_checkpoint`, so requests already in the queue can still settle, but anyone who has not yet called `requestWithdrawal` cannot exit.
+
+**What an attacker can do.** A malicious or compromised distributor contract can permanently lock staked assets for all accounts that have not yet submitted a withdrawal request. This can also happen accidentally if the distributor is simply buggy.
+
+**Conditions required.** The vault owner sets `rewardDistributor` to a contract whose `checkpoint` function reverts under any reachable condition (e.g., on re-entry, on insufficient gas, on a broken state dependency). Because the setter is one-shot, there is no administrative recovery path.
+
+**Fix.** Wrap the call in a try/catch, or add a governance escape hatch (e.g., allow the owner to clear the distributor address in an emergency). At a minimum, add integration checks before calling `setRewardDistributor`.
+
+---
+
+## Medium
+
+### M-1 — `FixedPointMath.mulDiv()` reverts on intermediate overflow, blocking legitimate operations
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**Vulnerability.** The implementation is:
+
+```solidity
+return (x * y) / d;
+```
+
+Solidity 0.8 reverts on overflow, so this reverts whenever `x * y > type(uint256).max`, even if the true quotient `x * y / d` would fit in a `uint256`. The standard fix (used by OpenZeppelin and others) is 512-bit intermediate arithmetic.
+
+**What an attacker (or operator) can cause.** Callers include `convertToShares`, `convertToAssets`, `notifyReward`, and `completeWithdrawal`. For example, if `amount * WAD` in `notifyReward` overflows (`amount > ~1.15 × 10^59`), the call reverts and no reward can ever be notified again with that supply. Similarly, if `assets * supply` overflows in `convertToShares`, deposits of large amounts revert. With rebasing tokens or high-emission scenarios this can become a realistic denial of service.
+
+**Conditions required.** Any single input pair `(x, y)` where `x * y > 2^256 − 1`. Practically reached when token amounts exceed roughly `2^128` raw units.
+
+**Fix.** Replace the naive implementation with a proper 512-bit mulDiv (e.g., OpenZeppelin's `Math.mulDiv`, or the Solady variant). This is a drop-in replacement with the same interface.
+
+---
+
+### M-2 — `WithdrawalQueue` accepts a zero cooldown, defeating the two-phase exit security model
+
+**File:** `src/core/WithdrawalQueue.sol`  
+**Function:** `constructor()` (line 50)
+
+**Vulnerability.** There is no lower-bound check on `cooldown_`. If deployed with `cooldown_ = 0`, `unlockAt = block.timestamp + 0 = block.timestamp`, and the `block.timestamp < request.unlockAt` guard in `settle` is always false, making the cooldown period a no-op.
+
+**What an attacker can do.** With zero cooldown an attacker can atomically stake and unstake within a single block (or across two transactions in the same block). This enables flash-loan-style exploitation of any state that favors large instantaneous balances — most directly, manipulating the reward distribution index: stake large → `notifyReward` in same block → `requestWithdrawal` → `claim`.
+
+**Conditions required.** The deployer (owner) passes `cooldown_ = 0` to `StakingVault`'s constructor. Because `cooldown` is immutable in `WithdrawalQueue`, this cannot be corrected after deployment.
+
+**Fix.** Add `require(cooldown_ > 0, "COOLDOWN_ZERO");` in `WithdrawalQueue.constructor`, and consider enforcing a minimum (e.g., 1 hour) as a deployment invariant.
+
+---
+
+## Low
+
+### L-1 — `setGuardian()` silently accepts `address(0)`, disabling the guardian without warning
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian()` (line 201)
+
+**What an attacker can do.** An owner whose key is compromised could be coerced into calling `setGuardian(address(0))`, silently removing the secondary pause role. Future incidents requiring an emergency pause would have to wait for the owner to act rather than the faster-responding guardian.
+
+**Conditions required.** Owner calls `setGuardian(address(0))`. No error is thrown; the event emitted shows the zero address but nothing enforces that it is caught.
+
+**Fix.** Add `require(newGuardian != address(0), "GUARDIAN_ZERO");` (or a custom error) before the assignment.
+
+---
+
+### L-2 — `Ownable2Step.transferOwnership()` accepts `address(0)` as the nominee
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do.** If the owner calls `transferOwnership(address(0))`, `pendingOwner` is set to the zero address. Because `address(0)` can never call `acceptOwnership`, the transfer is silently voided and a misleading `OwnershipTransferStarted(owner, address(0))` event is emitted. Off-chain monitoring tools may interpret this as a renunciation. The current owner retains full control and can re-initiate, so funds are not at risk, but the misleading event is a monitoring hazard.
+
+**Conditions required.** Owner intentionally or accidentally passes `address(0)`.
+
+**Fix.** Add a zero-address check in `transferOwnership`, matching the check already present in `constructor`.
+
+---
+
+## Informational
+
+**I-1 — Reentrancy guards use `0`/`1` transitions (cold-slot SSTORE cost every call).** Both `StakingVault` and `RewardDistributor` initialise `_entered` to `0` and toggle to `1`/`0`. Because the slot starts cold, every guarded call pays the full 20,000-gas cold SSTORE for the `0 → 1` write. Using `1`/`2` (so the slot is warm after the first call) halves this cost for all subsequent interactions — a standard gas optimisation.
+
+**I-2 — `accrueYield` uses `require` instead of a custom error.** `require(totalSupply != 0, "NO_SUPPLY")` is inconsistent with the rest of the codebase (which uses typed custom errors). This makes it harder for integrators to parse revert reasons programmatically and harder for auditors to grep for all revert conditions.
+
+**I-3 — No minimum first-deposit protection.** There are no virtual shares or minimum-deposit invariants. The inflation attack (deposit 1 wei, donate to inflate `totalAssets`) is mitigated because `totalAssets` is tracked in storage rather than read from the token balance. However, an owner who calls `accrueYield` with an extremely large amount before any second depositor can push the share price so high that dust deposits revert with `ZeroShares`. This is a centralisation risk rather than a permissionless attack, but worth noting for deployment runbooks.

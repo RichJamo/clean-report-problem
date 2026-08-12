@@ -1,0 +1,134 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            07
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:27:54Z
+# duration-ms:    335952
+# num-turns:      15
+# context-tokens: 116917
+# output-tokens:  19742
+# cost-usd:       0.40562339999999997
+# is-error:       False
+# session-id:     d8188979-6ee5-4838-966f-8c604909f5cf
+# ---- agent output below this line ----
+Now I have a complete picture of the codebase. Let me compile the audit findings.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/SafeTransferLib.sol`, `src/libraries/FixedPointMath.sol`
+
+---
+
+## [CRITICAL-1] `RewardDistributor.claim()` never clears `accrued[msg.sender]` — unlimited double-claim drain
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:** Any user whose `accrued` balance has been set by a checkpoint can call `claim()` repeatedly in separate transactions, draining the entire reward token balance of the distributor, regardless of how many reward tokens they legitimately earned.
+
+**Conditions required:**
+1. The reward distributor is funded (owner has called `notifyReward`).
+2. The attacker has a non-zero `accrued[attacker]`. This is triggered whenever the vault calls `checkpoint` *after* a reward notification — which happens on every `deposit` or `requestWithdrawal` that follows any `notifyReward`.
+
+**Root cause:** `claim()` computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)` and updates `userIndex[msg.sender] = globalIndex` (correctly zeroing future `_pendingFor` results), but **never resets `accrued[msg.sender]` to zero**. On every subsequent call, `_pendingFor` returns 0 but `accrued[msg.sender]` still holds the full historical value, so `amount` is non-zero and the transfer succeeds again.
+
+**Attack scenario:**
+```
+1. Alice stakes 100e18 → checkpoint(alice): accrued[alice] = 0, userIndex[alice] = 0
+2. Owner calls notifyReward(100e18) → globalIndex = 1e18
+3. Alice stakes 1 wei  → checkpoint(alice):
+      pending = 100e18 * (1e18 - 0) / 1e18 = 100e18
+      accrued[alice] = 100e18
+      userIndex[alice] = 1e18
+4. Alice calls claim()  → amount = 100e18 + 0 = 100e18 transferred
+                           userIndex[alice] = 1e18  (already set)
+                           accrued[alice] = 100e18  ← NEVER CLEARED
+5. Alice calls claim()  → amount = 100e18 + 0 = 100e18 transferred again
+6. Repeat until distributor is empty.
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+## [MEDIUM-1] `SafeTransferLib` does not verify contract existence — silent failed transfers
+
+**File:** `src/libraries/SafeTransferLib.sol`  
+**Functions:** `safeTransfer()` (line 14), `safeTransferFrom()` (line 20)
+
+**What an attacker can do:** If the `asset` or `rewardToken` address contains no contract code (e.g., the token self-destructs or is deployed to the wrong address), all token transfers silently succeed — the vault records deposits and pays out withdrawals, but no tokens actually move. A sophisticated deployer could exploit a future CREATE2 address collision to remove code after deployment.
+
+**Conditions required:** The token address resolves to an account with no deployed code at the time of the call. A low-level `call` to a non-contract always returns `(true, "")`, and `_succeeded("")` returns `true` because `data.length == 0`.
+
+**Root cause:**
+```solidity
+(bool ok, bytes memory data) =
+    address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+if (!ok || !_succeeded(data)) revert TransferFailed();
+```
+`ok` is `true` for any call to a non-contract; `data` is empty; `_succeeded` returns `true` — so no revert.
+
+**Fix:** Add an `extcodesize` check before the call, reverting if the target has no code.
+
+---
+
+## [LOW-1] `deposit()` has no minimum-shares output parameter — depositors are exposed to sandwich attacks
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (line 124)
+
+**What an attacker can do:** A sandwicher can front-run a pending deposit with a large `accrueYield` call (or collude with the owner), raising the share price so the victim receives far fewer shares than they expected, then back-run to profit from the price difference.
+
+**Conditions required:** The victim submits a `deposit` transaction; the owner is willing to call `accrueYield` (or a MEV searcher can influence ordering). The attacker profits from the dilution without violating any access controls.
+
+**Fix:** Accept a `minSharesOut` parameter and revert if `shares < minSharesOut`.
+
+---
+
+## [LOW-2] `Ownable2Step.transferOwnership` accepts `address(0)` as `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do:** The owner cannot lose control through this path alone (address(0) can never call `acceptOwnership`), but setting `pendingOwner = address(0)` emits a misleading `OwnershipTransferStarted` event. Off-chain monitoring or multisig tooling may misinterpret this as an intent to renounce ownership. An accidental call with a mistyped zero argument leaves no recovery path other than re-calling `transferOwnership` with the correct address.
+
+**Conditions required:** The owner calls `transferOwnership(address(0))`, either accidentally or as a result of a UI bug.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` in `transferOwnership`.
+
+---
+
+## [INFO-1] `nonReentrant` uses `0` as the "safe" sentinel — cold SSTORE on every first entry
+
+**Files:** `src/core/StakingVault.sol` (line 59), `src/rewards/RewardDistributor.sol` (line 46)
+
+Both contracts initialize `_entered` to `0` (the EVM default). Every function invocation therefore toggles the slot from `0 → 1` (cold write, 20,000 gas) and back to `0` on return. The conventional optimization—initializing to `1` and toggling to `2`—keeps the slot warm after construction and reduces the SSTORE cost to 100 gas per guard activation. This is a gas inefficiency, not a security issue.
+
+---
+
+## [INFO-2] `FixedPointMath.mulDiv` performs unchecked intermediate multiplication
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+The implementation is `(x * y) / d`. Solidity 0.8.x will revert on overflow, so there is no silent corruption, but any call where `x * y > type(uint256).max` becomes a revert. For realistic staking-vault token amounts this threshold is unreachable in practice, but unlike OpenZeppelin's 512-bit `mulDiv`, there is no guarantee of correctness for very large values. No exploitable path exists given current token supply constraints.
+
+---
+
+## Summary
+
+| ID | Severity | File | Finding |
+|----|----------|------|---------|
+| CRITICAL-1 | Critical | `RewardDistributor.sol` | `claim()` never clears `accrued[msg.sender]`; unlimited re-drain |
+| MEDIUM-1 | Medium | `SafeTransferLib.sol` | No contract-existence check; silent transfer failure |
+| LOW-1 | Low | `StakingVault.sol` | `deposit()` missing `minSharesOut` slippage guard |
+| LOW-2 | Low | `Ownable2Step.sol` | `transferOwnership` accepts `address(0)` as pending owner |
+| INFO-1 | Info | `StakingVault.sol`, `RewardDistributor.sol` | Reentrancy guard cold-SSTORE on every call |
+| INFO-2 | Info | `FixedPointMath.sol` | `mulDiv` reverts (not wraps) on overflow; no practical impact |
+
+The sole issue requiring immediate remediation before any deployment is **CRITICAL-1**: the missing `accrued[msg.sender] = 0` reset in `RewardDistributor.claim()`. Every other checkpointed user is a potential drainer under normal usage patterns.

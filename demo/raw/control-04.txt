@@ -1,0 +1,183 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            04
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:09:56Z
+# duration-ms:    366777
+# num-turns:      14
+# context-tokens: 79766
+# output-tokens:  21296
+# cost-usd:       0.47436
+# is-error:       False
+# session-id:     d452cb49-a93b-40dd-94f0-348868593c92
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Date:** 2026-08-12  
+**Scope:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `FixedPointMath`, `SafeTransferLib`
+
+---
+
+## CRITICAL
+
+### C-1 — `accrued` balance never cleared in `RewardDistributor.claim()`
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:**  
+Call `claim()` repeatedly to drain the entire reward-token balance of the contract. Each successive call transfers the same `accrued[msg.sender]` amount again, so the attacker multiplies their payout by the number of times they call the function.
+
+**Conditions:**  
+The attacker must have non-zero `accrued` rewards (obtained by staking before a `notifyReward` call, or by having any pending rewards checkpointed). After that, any EOA or contract can loop on `claim()` until the distributor is empty.
+
+**Root cause:**  
+`claim()` updates `userIndex[msg.sender] = globalIndex` (which zeros future *pending* rewards) but never sets `accrued[msg.sender] = 0`. The next call therefore recomputes `amount = accrued[msg.sender] + 0` and pays the same stale accrued value again.
+
+```solidity
+// RewardDistributor.sol:119-129  —  accrued is read but never cleared
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // pending → 0 ✓
+    totalClaimed += amount;
+    // ❌ accrued[msg.sender] is never reset
+    rewardToken.safeTransfer(msg.sender, amount);
+    emit Claimed(msg.sender, amount);
+}
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before or after the `userIndex` update.
+
+---
+
+## HIGH
+
+### H-1 — Withdrawal request permanently bricked if fee-recipient transfer fails
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+**What an attacker can do:**  
+This is primarily a griefing/safety issue rather than a direct theft vector. If the fee transfer to `feeRecipient` reverts after `withdrawalQueue.settle()` has already committed `request.settled = true`, the user's withdrawal is permanently lost — the state is irrecoverable and the tokens remain locked in the vault forever with no admin-rescue path.
+
+**Conditions:**  
+1. The request was created with a non-zero `feeBps` (i.e., `withdrawalFeeBps > 0` at request time).  
+2. At the moment of `completeWithdrawal`, `feeRecipient` cannot receive the token. This can happen because:
+   - The `FeeController` owner changes `feeRecipient` to a contract that rejects ERC-20 transfers (accidental misconfiguration or deliberate griefing by a compromised key).
+   - The token issuer (USDC, USDT, etc.) blacklists `feeRecipient` after withdrawal requests are already queued — a realistic post-deployment event outside the protocol's control.
+
+**Root cause:**  
+The queue marks the request settled unconditionally before performing any token transfers, violating Checks-Effects-Interactions order across two separate external calls.
+
+```solidity
+// StakingVault.sol:166-178
+function completeWithdrawal(uint256 id) external nonReentrant returns (uint256 paid) {
+    (uint256 assets, uint256 feeBps) = withdrawalQueue.settle(id, msg.sender); // ← settled = true, no rollback
+
+    uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
+    paid = assets - fee;
+
+    if (fee != 0) {
+        asset.safeTransfer(feeController.feeRecipient(), fee); // ← reverts here → user funds locked permanently
+    }
+    asset.safeTransfer(msg.sender, paid);
+}
+```
+
+Note also that `feeRecipient` is read from live `FeeController` state at *completion* time, not from the stored request, so a change to `feeRecipient` between request and completion directly controls where the blocking transfer goes.
+
+**Fix:** Either (a) restructure so `settle()` is only called after successful transfers (requires returning unsettled on transfer failure), or (b) adopt a pull pattern for fees (accumulate in storage; let the recipient pull separately), ensuring the user's transfer can never be blocked by a fee-routing failure.
+
+---
+
+## MEDIUM
+
+### M-1 — Unprotected intermediate multiplication in `FixedPointMath.mulDiv`
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:**  
+Trigger a revert in `notifyReward`, `_pendingFor`, or share price conversions by driving values high enough that `x * y` overflows `uint256`. This can permanently DoS reward distribution or withdrawals for a specific user.
+
+**Conditions:**  
+- In `notifyReward`: `amount * 1e18` overflows if `amount > type(uint256).max / 1e18 ≈ 1.16 × 10^59`. Tokens with 18 decimals and supply in the billions would need a reward notification on the order of 10^41 tokens — practically unreachable in isolation.  
+- In `_pendingFor`: `balance * delta` overflows if a user has not claimed for a very long time and both their balance and the accumulated `globalIndex` delta are large. A user who never claims could eventually reach an uncallable state, permanently locking their rewards.  
+
+Because Solidity 0.8.x panics on overflow rather than wrapping, the consequence is a hard revert rather than silent corruption, but it can still become a permanent DoS against individual users.
+
+**Fix:** Replace `(x * y) / d` with a 512-bit-safe implementation such as Solmate's or OpenZeppelin's `Math.mulDiv`, which avoids overflow by using assembly or a two-step algorithm.
+
+---
+
+## LOW
+
+### L-1 — Zero-value withdrawal request allowed
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `requestWithdrawal()` (line 143)
+
+**What an attacker can do:**  
+Burn a non-zero number of shares in exchange for zero assets. The assets booked into the withdrawal queue are computed as `floor(shares * totalAssets / totalSupply)`, which is zero when `shares * totalAssets < totalSupply`. The queue entry records `assets = 0`, and `completeWithdrawal` subsequently transfers nothing. The shares are permanently destroyed and the user receives nothing.
+
+**Conditions:**  
+- Share price has been significantly inflated (totalAssets >> totalSupply, e.g. after heavy yield accrual).  
+- A user holds a small residual share balance worth less than 1 unit.  
+- No `require(assets > 0)` guard exists.
+
+**Fix:** Add `if (assets == 0) revert ZeroAmount();` after computing `assets`.
+
+---
+
+### L-2 — `guardian` address not validated in constructor
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `constructor` (line 89)
+
+`initialGuardian` is stored without any check. If it is set to `address(0)` by mistake, the guardian role silently becomes unusable. `setGuardian` has the same omission. This is a configuration risk: only the owner can pause if `guardian == address(0)`, and there is no way to detect the misconfiguration on-chain.
+
+**Fix:** Add a zero-address revert (or emit an explicit event so tooling can flag it), consistently across both the constructor and `setGuardian`.
+
+---
+
+### L-3 — `transferOwnership` accepts `address(0)` as `newOwner`
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+Setting `pendingOwner = address(0)` does not immediately break ownership (since `address(0)` can never call `acceptOwnership`), but it silently cancels any in-flight transfer and may confuse off-chain monitoring that watches `OwnershipTransferStarted`. More critically, both `StakingVault` and `FeeController` inherit this, and a mistyped `transferOwnership(address(0))` call would leave the contract in an ambiguous state until corrected.
+
+**Fix:** Add `require(newOwner != address(0))` in `transferOwnership`.
+
+---
+
+### L-4 — Reentrancy guard uses `0` as the "unlocked" sentinel
+
+**File:** `src/core/StakingVault.sol` (line 59), `src/rewards/RewardDistributor.sol` (line 46)
+
+Both contracts initialise `_entered` at the default `0` and use the pattern `0 = unlocked, 1 = locked`. The first call into any guarded function therefore writes to a cold storage slot (gas: ~20 000), whereas the `1/2` convention (Solmate, OZ v5) keeps the slot permanently warm (gas: ~100 on subsequent calls). This is a gas inefficiency rather than a security vulnerability, but at high call frequency it meaningfully increases user costs.
+
+**Fix:** Initialise `_entered = 1` in the constructor and use `2` as the locked state.
+
+---
+
+## Summary Table
+
+| ID  | Severity | Contract / Function | Impact |
+|-----|----------|---------------------|--------|
+| C-1 | Critical | `RewardDistributor.claim` | `accrued` never zeroed — full reward-token drain |
+| H-1 | High | `StakingVault.completeWithdrawal` | Fee transfer failure after `settle` locks user funds permanently |
+| M-1 | Medium | `FixedPointMath.mulDiv` | Overflow DoS on reward distribution or pending calculations |
+| L-1 | Low | `StakingVault.requestWithdrawal` | Shares burned for zero assets with no guard |
+| L-2 | Low | `StakingVault` constructor / `setGuardian` | Silent zero-address guardian |
+| L-3 | Low | `Ownable2Step.transferOwnership` | Zero-address accepted as pending owner |
+| L-4 | Info | `StakingVault`, `RewardDistributor` reentrancy guard | Unnecessary cold-SSTORE cost |

@@ -1,0 +1,251 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            09
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:37:35Z
+# duration-ms:    381503
+# num-turns:      15
+# context-tokens: 120975
+# output-tokens:  17274
+# cost-usd:       0.42612975
+# is-error:       False
+# session-id:     18472cde-524f-4f43-a642-3fc20aa6642c
+# ---- agent output below this line ----
+I have a complete picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/` (all contracts)  
+**Solidity version:** 0.8.24  
+**Date:** 2026-08-12
+
+---
+
+## Finding 1 — CRITICAL: `RewardDistributor.claim` never resets `accrued`, enabling unlimited reward drainage
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+### What an attacker can do
+
+Any staker whose `accrued[account]` has been written to a nonzero value can call `claim()` repeatedly in separate transactions and receive the same reward amount each time until the distributor's entire reward token balance is drained.
+
+### Conditions required
+
+1. The attacker must be a staker (any nonzero share balance).
+2. The owner must have called `notifyReward` at least once while the attacker held shares.
+3. The attacker (or any other vault user) must have triggered a vault operation (`deposit` or `requestWithdrawal`) that caused `_checkpoint` to run on the attacker's account *after* that notification. This is the only way `accrued[account]` is written to a nonzero value.
+
+Once those conditions are met, the attacker calls `claim()` over and over. Every call computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`. The `_pendingFor` component is zeroed by updating `userIndex[msg.sender] = globalIndex`, but **`accrued[msg.sender]` is never set to zero**. On every subsequent call, `_pendingFor` returns 0 but `accrued[msg.sender]` still holds the original nonzero value, so `amount` remains positive and the transfer succeeds.
+
+### Root cause
+
+```solidity
+// RewardDistributor.sol:119-129
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // clears _pendingFor
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ← accrued[msg.sender] is never zeroed
+    emit Claimed(msg.sender, amount);
+}
+```
+
+The fix is to add `accrued[msg.sender] = 0;` before (or immediately after) computing `amount`.
+
+---
+
+## Finding 2 — HIGH: `rewardDistributor` can be set to a buggy contract and is permanently irremovable
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setRewardDistributor()` (line 194), `_checkpoint()` (line 222), `deposit()` (line 124), `requestWithdrawal()` (line 143)
+
+### What an attacker can do
+
+If the deployed `rewardDistributor` ever causes `checkpoint` to revert — whether due to a bug in the distributor itself or a compromised owner supplying a malicious contract — then both `deposit` and `requestWithdrawal` permanently revert for every user. Staked assets become unrecoverable because `requestWithdrawal` is the only entry point to the two-phase exit, and it calls `_checkpoint` unconditionally.
+
+### Conditions required
+
+- The owner sets the distributor to an address whose `checkpoint` reverts under any reachable condition.
+- Because `setRewardDistributor` enforces `DistributorAlreadySet` and there is no removal function, this state cannot be corrected by any on-chain action after the fact.
+
+### Root cause
+
+```solidity
+// StakingVault.sol:194-199
+function setRewardDistributor(IRewardDistributor distributor) external onlyOwner {
+    if (address(rewardDistributor) != address(0)) revert DistributorAlreadySet();
+    // No way to ever unset or replace
+    rewardDistributor = distributor;
+}
+
+// StakingVault.sol:222-227  — called by deposit AND requestWithdrawal
+function _checkpoint(address account) private {
+    IRewardDistributor distributor = rewardDistributor;
+    if (address(distributor) != address(0)) {
+        distributor.checkpoint(account);   // uncaught revert traps funds
+    }
+}
+```
+
+Mitigations include: wrapping the call in a `try/catch` so a reverting distributor degrades gracefully, or allowing the owner to replace the distributor.
+
+---
+
+## Finding 3 — MEDIUM: `deposit` makes an external call before mutating state (CEI violation)
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (line 124)
+
+### What an attacker can do
+
+A malicious or compromised `rewardDistributor` (set by the owner) gains a re-entry window between the `_checkpoint` call and the vault's state updates. Within that window, `totalAssets`, `totalSupply`, and `balanceOf` still reflect pre-deposit values. Any vault logic that reads these values during the callback will observe stale data.
+
+Direct reentrancy back into `deposit`, `requestWithdrawal`, `completeWithdrawal`, or `accrueYield` is blocked by the shared `nonReentrant` guard. Functions without that guard — such as the view helpers `convertToShares` / `convertToAssets` — can be called and will return stale exchange-rate values during the callback.
+
+### Conditions required
+
+- The `rewardDistributor` is a contract that re-enters the vault from inside `checkpoint`.
+- Owner-level trust is required to set the distributor, but the risk surface is still real (key compromise, supply-chain issue in the distributor contract).
+
+### Root cause
+
+```solidity
+// StakingVault.sol:124-139
+function deposit(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
+    if (assets == 0) revert ZeroAmount();
+
+    _checkpoint(msg.sender);          // ← external call first
+
+    shares = convertToShares(assets);
+    if (shares == 0) revert ZeroShares();
+
+    totalAssets += assets;            // ← state mutations after
+    totalSupply += shares;
+    balanceOf[msg.sender] += shares;
+
+    asset.safeTransferFrom(msg.sender, address(this), assets);
+    ...
+}
+```
+
+The external call should follow all state mutations (standard checks-effects-interactions pattern).
+
+---
+
+## Finding 4 — MEDIUM: `FixedPointMath.mulDiv` uses naive multiplication, risking overflow-based DoS
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+### What an attacker can do
+
+Any path that passes sufficiently large operands through `mulDiv` will cause an overflow revert in Solidity 0.8.x, producing a denial-of-service condition. The highest-risk call site is `notifyReward`:
+
+```solidity
+// RewardDistributor.sol:112
+globalIndex += amount.mulDiv(FixedPointMath.WAD, supply);
+// intermediate: amount * 1e18
+```
+
+If a token has an exceptionally large supply (or if dust-staking drives `supply` to 1 wei), the numerator `amount × 1e18` can overflow before the division reduces it. A similar overflow exists in `_pendingFor` when `balanceOf × delta` is computed:
+
+```solidity
+// RewardDistributor.sol:137
+return vault.balanceOf(account).mulDiv(delta, FixedPointMath.WAD);
+```
+
+### Conditions required
+
+- Intermediate product `x * y > 2^256`. With `WAD = 1e18`, this requires `x > ~1.16 × 10^59`, which is unrealistic for most tokens but is architecture-level risk for tokens with very large supplies or amounts passed in the future.
+
+### Root cause
+
+```solidity
+// FixedPointMath.sol:14
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // no 512-bit intermediary
+}
+```
+
+The standard remediation is the Uniswap v3 / OpenZeppelin `mulDiv` algorithm that computes the full 512-bit product before dividing.
+
+---
+
+## Finding 5 — LOW: `transferOwnership` accepts `address(0)` as pending owner
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+### What an attacker can do
+
+The owner can accidentally call `transferOwnership(address(0))`. This emits an `OwnershipTransferStarted` event pointing to the zero address. Because `address(0)` can never be `msg.sender`, `acceptOwnership` can never be called to complete the transfer, so the original owner is not displaced — but until the owner issues a second `transferOwnership` call to a real address, the state is misleading and could cause off-chain tooling to misread ownership status.
+
+### Conditions required
+
+- Owner calls `transferOwnership(address(0))` (e.g., by pasting the wrong address).
+
+### Root cause
+
+```solidity
+// Ownable2Step.sol:30-33
+function transferOwnership(address newOwner) external onlyOwner {
+    pendingOwner = newOwner;   // no address(0) guard
+    emit OwnershipTransferStarted(owner, newOwner);
+}
+```
+
+Add `require(newOwner != address(0), "OWNER_ZERO");`.
+
+---
+
+## Finding 6 — LOW: `setGuardian` accepts `address(0)`, silently removing the guardian role
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian()` (line 201)
+
+### What an attacker can do
+
+The owner can set `guardian = address(0)`. The `pause` function checks:
+
+```solidity
+if (msg.sender != owner && msg.sender != guardian) revert NotGuardian();
+```
+
+With `guardian == address(0)`, the guardian branch is unreachable (no signer has that address), so only the owner can pause. The guardian role is silently neutered with no event distinguishing "guardian intentionally removed" from "guardian accidentally zeroed." Monitoring systems that relied on the guardian for emergency response would silently lose it.
+
+### Conditions required
+
+- Owner calls `setGuardian(address(0))`.
+
+### Root cause
+
+```solidity
+// StakingVault.sol:201-204
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;   // no zero-address guard
+}
+```
+
+---
+
+## Summary table
+
+| # | Severity | Contract | Function | Issue |
+|---|----------|----------|----------|-------|
+| 1 | **Critical** | `RewardDistributor` | `claim` | `accrued` never reset → infinite re-claim drains reward balance |
+| 2 | **High** | `StakingVault` | `setRewardDistributor` / `_checkpoint` | Immutable distributor with no fallback; reverting distributor permanently bricks withdrawals |
+| 3 | **Medium** | `StakingVault` | `deposit` | External call before state mutations violates CEI; stale state visible during callback |
+| 4 | **Medium** | `FixedPointMath` | `mulDiv` | Naive `x * y` intermediate overflows with large operands, enabling DoS |
+| 5 | **Low** | `Ownable2Step` | `transferOwnership` | No zero-address guard; misleading event and state if zero address is passed |
+| 6 | **Low** | `StakingVault` | `setGuardian` | No zero-address guard; silently removes guardian pause capability |

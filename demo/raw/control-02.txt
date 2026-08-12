@@ -1,0 +1,153 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control
+# run:            02
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T13:58:30Z
+# duration-ms:    269856
+# num-turns:      13
+# context-tokens: 91780
+# output-tokens:  15876
+# cost-usd:       0.33299985
+# is-error:       False
+# session-id:     a72667f9-3f38-4f6b-8d79-1690976e1789
+# ---- agent output below this line ----
+I've read all contracts, libraries, interfaces, and tests. Let me now compile the full audit report.
+
+---
+
+# Security Audit Report
+
+**Project:** StakingVault / RewardDistributor  
+**Scope:** `src/` (all contracts)  
+**Compiler:** Solidity 0.8.24  
+**Date:** 2026-08-12
+
+---
+
+## CRITICAL
+
+### C-1 — `RewardDistributor.claim()` never zeroes `accrued[msg.sender]`
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:**  
+Any user whose rewards were ever banked into `accrued` via `checkpoint` can call `claim()` repeatedly — in separate transactions — to drain the entire reward-token balance of the distributor, stealing tokens that belong to other stakers.
+
+**Conditions required:**  
+1. The attacker has staked in the vault and some rewards were notified while they held shares.  
+2. A `checkpoint` was triggered for their account (this happens automatically on every `deposit` or `requestWithdrawal`), which writes their pending rewards into `accrued[attacker]`.  
+3. The attacker calls `distributor.claim()` more than once.
+
+**Root cause:**  
+`claim()` computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, updates `userIndex[msg.sender] = globalIndex` (so `_pendingFor` returns 0 on the next call), transfers the tokens — but **never resets `accrued[msg.sender]` to 0**. Every subsequent call returns the same non-zero `accrued` value and transfers it again.
+
+```solidity
+// claim() — missing:  accrued[msg.sender] = 0;
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+    rewardToken.safeTransfer(msg.sender, amount);   // accrued is still set after this
+    emit Claimed(msg.sender, amount);
+}
+```
+
+**Proof-of-concept trace:**
+```
+1. Alice stakes 100 shares.
+2. notifyReward(40 ether)  →  globalIndex = 0.4 WAD
+3. Alice calls deposit(1)  →  _checkpoint triggers:
+      accrued[alice] = 40 ether,  userIndex[alice] = globalIndex
+4. Alice calls claim()  →  amount = 40 ether, transfer 40 ether to Alice.
+      accrued[alice] still == 40 ether  ← BUG
+5. Alice calls claim() again  →  amount = 40 ether, transfer 40 ether again.
+6. Repeat until contract is empty.
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+## MEDIUM
+
+### M-1 — `FixedPointMath.mulDiv` uses unchecked intermediate multiplication
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:**  
+An attacker cannot directly profit from this, but it can permanently deny service to `notifyReward` (and therefore all future reward accrual) by causing a revert if `amount * WAD` overflows `uint256`.
+
+**Conditions required:**  
+A reward notification where `amount > type(uint256).max / 1e18` (≈ 1.16 × 10^59 tokens). Unlikely in practice but achievable if the reward token has many decimals or the deployer passes a sufficiently large value.
+
+**Root cause:**  
+`mulDiv` computes `(x * y) / d` with plain Solidity multiplication. Solidity 0.8.x wraps overflow checks as reverts, so an overflowing product does not silently corrupt state — it simply reverts. The fix is a 512-bit intermediate (e.g., Mullen's algorithm), which is the industry standard for `mulDiv` in financial contracts.
+
+---
+
+### M-2 — Incompatibility with fee-on-transfer tokens causes `totalAssets` inflation
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit()` (line 124), `accrueYield()` (line 183)
+
+**What an attacker can do:**  
+With a fee-on-transfer asset, every deposit and yield accrual credits `totalAssets` with the full requested amount while the vault receives fewer tokens. Over time `totalAssets` exceeds the vault's actual token balance. Later depositors mint fewer shares than they should relative to the real backing, and eventually some withdrawals will revert because the vault lacks the tokens to pay out.
+
+**Conditions required:**  
+The staked `asset` charges a transfer fee. This is a configuration risk rather than an exploit against a normal ERC-20, but the contract provides no guard (no before/after balance check) and the README does not document supported token assumptions.
+
+---
+
+## LOW / INFORMATIONAL
+
+### L-1 — `setGuardian` accepts `address(0)`, silently disabling emergency pause
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian()` (line 201)
+
+**What an attacker can do:**  
+If the owner accidentally (or under social engineering) calls `setGuardian(address(0))`, the guardian slot is silently nulled. Only the owner can then pause the vault. If the owner key is slow to respond in an emergency, the additional fast-response pause path is gone.
+
+**Conditions required:**  
+Owner calls `setGuardian(address(0))`. No zero-address validation is present.
+
+---
+
+### L-2 — `Ownable2Step.transferOwnership` has no explicit cancel mechanism and accepts `address(0)`
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+`pendingOwner` can be set to `address(0)`, which is the de-facto way to cancel a pending transfer (nobody can call `acceptOwnership` as `address(0)`). This is not an exploit, but the intent is implicit and there is no `cancelOwnershipTransfer` function to document it. Operators may be surprised that passing `address(0)` silently cancels rather than validates.
+
+---
+
+### L-3 — Immutable `rewardDistributor` with no recovery path
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setRewardDistributor()` (line 194)
+
+`rewardDistributor` is set once and can never be updated. The critical bug found in C-1 is inside `RewardDistributor`. Because the vault locks in the distributor address permanently, there is no on-chain remediation path (e.g., pointing to a fixed distributor contract) without deploying a new vault and migrating all stakers.
+
+---
+
+## Summary Table
+
+| ID  | Severity    | Contract / Function                              | Impact                                          |
+|-----|-------------|--------------------------------------------------|-------------------------------------------------|
+| C-1 | Critical    | `RewardDistributor.claim()`                      | Full reward pool drained by any checkpointed user |
+| M-1 | Medium      | `FixedPointMath.mulDiv()`                        | DoS on `notifyReward` for extreme token amounts |
+| M-2 | Medium      | `StakingVault.deposit()` / `accrueYield()`       | Insolvency with fee-on-transfer tokens          |
+| L-1 | Low         | `StakingVault.setGuardian()`                     | Emergency pause capability silently removed     |
+| L-2 | Low         | `Ownable2Step.transferOwnership()`               | No explicit cancel, implicit `address(0)` idiom |
+| L-3 | Informational | `StakingVault.setRewardDistributor()`          | No upgrade path for a buggy distributor         |
+
+---
+
+**Priority recommendation:** Fix C-1 immediately — add `accrued[msg.sender] = 0;` in `RewardDistributor.claim()` before the token transfer. All other issues are secondary to this.

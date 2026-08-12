@@ -1,0 +1,162 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            10
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:47:54Z
+# duration-ms:    298351
+# num-turns:      22
+# context-tokens: 220214
+# output-tokens:  17049
+# cost-usd:       0.44378460000000003
+# is-error:       False
+# session-id:     3d34b0a7-349d-4a81-a581-b5cedc694169
+# ---- agent output below this line ----
+---
+
+## Security Audit Report — StakingVault Protocol
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/FixedPointMath.sol`  
+**Compiler:** Solidity 0.8.24  
+**Date:** 2026-08-12
+
+---
+
+### CRITICAL-1 — Reward tokens can be drained by any user who has been checkpointed
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:** Repeatedly call `claim()` in separate transactions to drain the entire reward token balance of the `RewardDistributor` contract.
+
+**Root cause:** `claim()` reads `accrued[msg.sender]` as part of the payout but never resets it to zero. After transferring tokens, `accrued[msg.sender]` retains its old value. On a second call, the function again computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, finds `_pendingFor` is 0 (because `userIndex` was updated to match `globalIndex` on the first call), but `accrued[msg.sender]` is still the full prior balance. The transfer fires again.
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);   // ← tokens sent
+    // accrued[msg.sender] is never zeroed          // ← BUG: remains non-zero
+    emit Claimed(msg.sender, amount);
+}
+```
+
+**Conditions required:**
+
+1. At least one `notifyReward` has been called so `globalIndex > 0`.
+2. The victim account subsequently calls `deposit()` or `requestWithdrawal()`, which triggers `_checkpoint()` on their behalf. `checkpoint()` writes `accrued[account] += pending` and then syncs `userIndex[account] = globalIndex`. After this, `accrued[account] > 0`.
+3. The attacker (who is or controls that account) then calls `claim()` as many times as needed, each time receiving the same `accrued` amount until the contract holds no reward tokens.
+
+This is a realistic path for any ordinary user of the protocol: stake → rewards are notified → make another deposit or begin withdrawal → claim repeatedly. No flash loan, no special privilege, and no reentrancy is required (the calls are sequential across transactions). The `nonReentrant` guard is irrelevant because the invariant is broken between calls.
+
+**Fix:** Zero out `accrued[msg.sender]` before (or immediately after) computing `amount`:
+
+```solidity
+accrued[msg.sender] = 0;
+```
+
+---
+
+### MEDIUM-1 — Fee recipient is not locked at withdrawal-request time
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+**What an attacker can do:** The owner (or a compromised owner key) can redirect collected exit fees to an arbitrary address by calling `FeeController.setFeeRecipient()` between the time a user submits a withdrawal request and the time they complete it.
+
+**Root cause:** The protocol correctly locks `feeBps` in the `WithdrawalQueue` at request time (ADR 0005), but `feeRecipient` is resolved live at settlement:
+
+```solidity
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);   // ← live read
+}
+```
+
+**Conditions required:** The owner must change `feeRecipient` after a withdrawal request is enqueued but before it is settled. The user still receives their agreed net amount (`assets – fee`); only the destination of the fee changes. The impact is misdirection of protocol revenue rather than direct theft from users, but it violates the principle that the fee terms agreed to at request time should be fully honoured.
+
+**Fix:** Store the `feeRecipient` address inside the `WithdrawalQueue.Request` struct alongside `feeBps`, both captured at `enqueue` time, and use the stored value in `completeWithdrawal`.
+
+---
+
+### LOW-1 — `FixedPointMath.mulDiv` uses a plain 256-bit intermediate product
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:** Cause legitimate vault operations to revert by pushing `totalAssets` or `totalSupply` to levels where `x * y` overflows a `uint256`, even when the true mathematical quotient would fit.
+
+**Root cause:**
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // x * y can overflow uint256
+}
+```
+
+This is called in `convertToShares`, `convertToAssets`, the fee calculation in `completeWithdrawal`, and the reward-index update in `RewardDistributor.notifyReward`. For example, `convertToShares(assets)` computes `assets * totalSupply / totalAssets`. If both `assets` and `totalSupply` are on the order of `2^128`, the product overflows.
+
+**Conditions required:** `totalAssets` or `totalSupply` must reach approximately `2^128` (≈ 3.4 × 10³⁸ tokens in base units). This is unlikely for assets with 18 decimals but is reachable for low-decimal or high-volume tokens over time.
+
+**Fix:** Replace `mulDiv` with a 512-bit-intermediate implementation such as the one in Solady or Uniswap v3's `FullMath`, which handles the full `uint256 × uint256` range without overflow.
+
+---
+
+### LOW-2 — Reentrancy guard is gas-inefficient due to 0 → 1 → 0 storage pattern
+
+**File:** `src/core/StakingVault.sol` (line 77), `src/rewards/RewardDistributor.sol` (line 58)  
+**Modifier:** `nonReentrant()`
+
+**What an attacker can do:** Nothing — this is not a security vulnerability, but it silently inflates gas costs for every guarded call.
+
+**Root cause:** Both contracts declare `uint256 private _entered` (default 0) and use the pattern `0 → 1 → 0`. Every call resets the slot to zero on exit. The next call then writes from zero to one again, which costs a full cold SSTORE (20,000 gas) rather than the warm non-zero-to-non-zero cost (2,900 gas).
+
+**Conditions required:** Every call to `deposit`, `requestWithdrawal`, `completeWithdrawal`, `accrueYield`, `notifyReward`, and `claim` pays this penalty.
+
+**Fix:** Initialise `_entered = 1` in the constructor and use the `1 → 2 → 1` pattern (the standard OpenZeppelin approach), so no call ever writes to a zero slot.
+
+---
+
+### INFORMATIONAL-1 — `transferOwnership` accepts `address(0)` as a pending owner
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do:** A careless owner can accidentally call `transferOwnership(address(0))`, setting `pendingOwner` to `address(0)`. Because `address(0)` can never call `acceptOwnership()`, the transfer can never be completed. The current owner retains control and can issue a corrective `transferOwnership` call, so no lockout is possible — but the state is confusing and any tooling that watches `OwnershipTransferStarted` events would see a misleading signal.
+
+**Conditions required:** Accidental or malformed call by the current owner.
+
+**Fix:** Add `require(newOwner != address(0))` at the top of `transferOwnership`.
+
+---
+
+### INFORMATIONAL-2 — Cooldown period is immutable and has no on-chain upper bound
+
+**File:** `src/core/WithdrawalQueue.sol`  
+**Constructor:** (line 50)
+
+**What an attacker can do:** A deployer (intentionally or by mistake) can set `cooldown_` to an arbitrarily large value (e.g., decades). Once deployed, this cannot be changed, and users cannot exit within a reasonable time even though the pause mechanism deliberately keeps exits open.
+
+**Conditions required:** Misconfigured deployment; no runtime check prevents `cooldown_ = type(uint64).max`.
+
+**Fix:** Enforce a reasonable maximum in the constructor (e.g., `require(cooldown_ <= 30 days, "COOLDOWN_TOO_LONG")`).
+
+---
+
+### Summary Table
+
+| ID | Severity | Contract | Function | Issue |
+|----|----------|----------|----------|-------|
+| C-1 | Critical | `RewardDistributor` | `claim()` | `accrued[msg.sender]` never zeroed; unlimited repeated drains |
+| M-1 | Medium | `StakingVault` | `completeWithdrawal()` | `feeRecipient` read live, not locked at request time |
+| L-1 | Low | `FixedPointMath` | `mulDiv()` | 256-bit intermediate overflow; DoS on extreme values |
+| L-2 | Low | `StakingVault`, `RewardDistributor` | `nonReentrant` modifier | 0→1→0 guard wastes ~17 k gas per call vs 1→2→1 |
+| I-1 | Info | `Ownable2Step` | `transferOwnership()` | `address(0)` accepted as pending owner |
+| I-2 | Info | `WithdrawalQueue` | constructor | Cooldown is immutable with no upper bound |
+
+The single issue that warrants immediate remediation before any mainnet deployment is **C-1**: the missing `accrued[msg.sender] = 0` line in `RewardDistributor.claim()`. All other findings are lower urgency but should be addressed in the same patch cycle.

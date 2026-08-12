@@ -1,0 +1,9 @@
+# Foundry build artefacts
+out/
+cache/
+broadcast/
+
+# Run sandboxes are created outside the repo; never commit one if it lands here
+sandbox/
+
+.DS_Store

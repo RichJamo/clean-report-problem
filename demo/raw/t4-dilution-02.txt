@@ -1,0 +1,233 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            02
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:02:13Z
+# duration-ms:    407310
+# num-turns:      19
+# context-tokens: 203101
+# output-tokens:  22798
+# cost-usd:       0.5441229
+# is-error:       False
+# session-id:     362b41b8-eaeb-4de6-a721-c60ff3cba5d6
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Let me produce the audit report.
+
+---
+
+# Smart Contract Security Audit Report
+
+**Project:** StakingVault  
+**Scope:** `src/` — all production contracts  
+**Commit:** pre-audit, no deployed instances  
+**Auditor:** Claude (claude-sonnet-4-6)  
+**Date:** 2026-08-12
+
+---
+
+## Summary
+
+| ID | Title | Severity | File |
+|----|-------|----------|------|
+| C-01 | `claim()` never clears `accrued`, enabling unlimited reward drain | Critical | `RewardDistributor.sol` |
+| M-01 | `deposit()` updates state before `safeTransferFrom` (CEI violation) | Medium | `StakingVault.sol` |
+| M-02 | Fee recipient resolved at settlement time, not request time | Medium | `StakingVault.sol` |
+| L-01 | `WithdrawalCompleted` event reports net paid amount under the `assets` field | Low | `StakingVault.sol` |
+| L-02 | `setGuardian` accepts `address(0)` without an explicit zero-address check | Low | `StakingVault.sol` |
+| I-01 | `mulDiv` uses a single-word intermediate product that overflows at extreme values | Info | `FixedPointMath.sol` |
+| I-02 | Ownership is non-renounceable by design | Info | `Ownable2Step.sol` |
+
+---
+
+## C-01 — `claim()` never clears `accrued`, enabling unlimited reward drain
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+### What an attacker can do
+
+Drain the entire reward-token balance of `RewardDistributor` by calling `claim()` repeatedly. Each call re-pays the same `accrued[msg.sender]` balance because that storage slot is never zeroed.
+
+### Conditions required
+
+The attacker must have a non-zero `accrued[msg.sender]` balance, which happens whenever the vault calls `checkpoint` before a share-balance change (every deposit or withdrawal request). No further privilege is needed.
+
+### Root cause
+
+```solidity
+// RewardDistributor.sol:119
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // ← pending set to zero
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);  // ← paid out
+
+    emit Claimed(msg.sender, amount);
+    // ← accrued[msg.sender] is NEVER reset to 0
+}
+```
+
+After the call, `userIndex[msg.sender] == globalIndex` so `_pendingFor` returns 0. But `accrued[msg.sender]` still holds its pre-claim value. The next call to `claim()` passes the `amount == 0` guard (because `accrued` is still positive) and transfers the same amount again.
+
+### Proof-of-concept trace
+
+1. Alice stakes 100 shares. Owner calls `notifyReward(50e18)`. `globalIndex` advances.
+2. Alice calls `deposit(1)` (or `requestWithdrawal`) → the vault calls `checkpoint(alice)`.  
+   Inside `checkpoint`: `pending = 50e18`; `accrued[alice] += 50e18` → **50e18**; `userIndex[alice] = globalIndex`.
+3. Alice calls `claim()` → receives 50e18. `accrued[alice]` remains **50e18**.
+4. Alice calls `claim()` again → receives another 50e18. Repeat until the contract is empty.
+
+### Fix
+
+Add `accrued[msg.sender] = 0;` before (or immediately after) the transfer:
+
+```solidity
+accrued[msg.sender] = 0;
+userIndex[msg.sender] = globalIndex;
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+```
+
+---
+
+## M-01 — `deposit()` updates state before `safeTransferFrom` (CEI violation)
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (line 124)
+
+### What an attacker can do
+
+With a callback-capable ERC-20 asset (e.g., ERC-777), the token contract fires a `tokensToSend` hook on the caller during `safeTransferFrom`. At that point, `balanceOf[msg.sender]` and `totalAssets` have already been updated to reflect shares the attacker has not yet paid for. Any function that reads vault state — including `RewardDistributor.claim()` (not guarded by StakingVault's own `nonReentrant` flag) — will see the inflated balance. Combined with C-01, this could compound the reward drain.
+
+### Conditions required
+
+The staked asset must support sender-side transfer callbacks (ERC-777 or similar). The `docs/token-assumptions.md` does not explicitly forbid such tokens, only fee-on-transfer and rebasing tokens.
+
+### Root cause
+
+```solidity
+// StakingVault.sol:131-136
+totalAssets += assets;          // state written
+totalSupply += shares;          // state written
+balanceOf[msg.sender] += shares;// state written — msg.sender appears to hold shares
+                                //                 they have not paid for yet
+asset.safeTransferFrom(msg.sender, address(this), assets);  // external call last
+```
+
+The nonReentrant guard prevents re-entry into any StakingVault function, but it does not prevent re-entry into `RewardDistributor` or any other external contract.
+
+### Fix
+
+Move the `safeTransferFrom` call before the state mutations (standard CEI ordering), or extend the token assumptions documentation to explicitly prohibit callback tokens.
+
+---
+
+## M-02 — Fee recipient resolved at settlement time, not request time
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+### What an attacker can do
+
+This is a DoS vector rather than a funds-theft vector. If `feeController.feeRecipient()` is changed to a contract that reverts on token receipt between request creation and completion, every in-flight withdrawal that carries a non-zero fee becomes permanently uncollectable until the recipient is changed back. Users' funds are safe (the withdrawal queue entry remains unsettled and can be retried), but they are inaccessible for an indefinite period.
+
+### Conditions required
+
+The FeeController owner must change the fee recipient to a reverting address. This can be an admin mistake or, if FeeController and StakingVault have separate owners, a deliberate act by the FeeController owner. The fee rate at request time is correctly captured and immutable (per the ADR), but the recipient address is not.
+
+### Root cause
+
+```solidity
+// StakingVault.sol:172-174
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);  // ← live query
+}
+```
+
+### Fix
+
+Capture and store the fee recipient inside `WithdrawalQueue.Request` at enqueue time (alongside `feeBps`), or add a separate `completeWithdrawal` path that lets a user accept the full gross amount if the fee transfer fails.
+
+---
+
+## L-01 — `WithdrawalCompleted` event reports net amount under the `assets` field
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 178)
+
+### What an attacker can do
+
+No direct exploit. Off-chain indexers and monitoring tools that parse this event and interpret the third field as the gross asset amount will silently under-count; discrepancy between the emitted figure and the `WithdrawalRequested` amount (which is gross) can cause reconciliation errors in analytics and alerting systems.
+
+### Root cause
+
+```solidity
+event WithdrawalCompleted(address indexed account, uint256 indexed id, uint256 assets, uint256 fee);
+//                                                                              ^^^^^^ named "assets"
+
+emit WithdrawalCompleted(msg.sender, id, paid, fee);
+//                                       ^^^^  paid = assets - fee  (net, not gross)
+```
+
+### Fix
+
+Either rename the event parameter to `paid` / `netAssets`, or pass the gross `assets` variable instead of `paid`.
+
+---
+
+## L-02 — `setGuardian` accepts `address(0)` without an explicit check
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian()` (line 201)
+
+### What an attacker can do
+
+No exploit by a third party. If the owner accidentally calls `setGuardian(address(0))`, the `GuardianUpdated` event fires with a zero address and there is no visible revert to signal the mistake. The guardian role is silently vacated; no one but the owner can pause the vault until a new guardian is set.
+
+### Conditions required
+
+Owner calls `setGuardian(address(0))` — accidental or deliberate.
+
+### Fix
+
+Add `require(newGuardian != address(0), "GUARDIAN_ZERO");` consistent with similar checks elsewhere in the codebase (e.g., `FeeController.setFeeRecipient`). If the intent is to explicitly allow removing the guardian, document and name the operation distinctly.
+
+---
+
+## I-01 — `mulDiv` uses a single-word intermediate that overflows at extreme input magnitudes
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // overflows when x * y > type(uint256).max
+}
+```
+
+Solidity 0.8.x will revert (not silently wrap) on overflow, so this cannot produce incorrect results — it will simply make the operation uncallable when both operands are very large. For the actual token amounts in this system the risk is theoretical, but a full-precision implementation (e.g., the Solady / PRBMath 512-bit `mulDiv`) eliminates the revert risk at no correctness cost.
+
+---
+
+## I-02 — Ownership is non-renounceable
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+The two-step handover design means a nomination to `address(0)` can never be accepted, so ownership cannot be renounced. This is likely intentional (and is good for safety), but it should be explicitly documented so integrators who expect a standard `renounceOwnership()` function are not surprised.
+
+---
+
+## Findings Not Raised
+
+- **Fee-on-transfer / rebasing asset tokens** — `docs/token-assumptions.md` explicitly documents that such tokens are unsupported. No finding raised; however, the assumption should be enforced with a prominent deployment checklist.
+- **Inflation / first-depositor manipulation** — Mitigated by tracking `totalAssets` in storage rather than reading the token balance. Unsolicited transfers cannot move the share price.
+- **Cooldown immutability** — The cooldown is set at construction and cannot be changed. This is an explicit ADR decision (ADR-0003).
+- **Reentrancy across StakingVault functions** — The `nonReentrant` guard correctly uses a 0/1 storage flag with proper initialization; no issue found.
+- **Reward distributor set-once constraint** — `setRewardDistributor` correctly enforces the one-shot wiring (ADR-0006); no issue found.

@@ -1,0 +1,160 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3-agentconfig
+# run:            01
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:51:21Z
+# duration-ms:    302959
+# num-turns:      14
+# context-tokens: 107800
+# output-tokens:  17544
+# cost-usd:       0.41200214999999996
+# is-error:       False
+# session-id:     97454ced-a0b7-47a6-b392-c4ede93b65d5
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Here is the full audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/auth/Ownable2Step.sol`, `src/core/FeeController.sol`, `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/libraries/FixedPointMath.sol`, `src/libraries/SafeTransferLib.sol`, `src/rewards/RewardDistributor.sol`
+
+---
+
+## CRITICAL
+
+### C-1 — `RewardDistributor.claim()` never zeros `accrued`, enabling unlimited drain
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()` (line 119)
+
+**What an attacker can do:** Any staker who has a non-zero `accrued[account]` balance can call `claim()` in an unbounded loop across multiple transactions and drain the entire reward token balance of the distributor. Each successful call transfers the full `accrued` amount again because the field is never cleared.
+
+**Conditions required:**
+1. At least one `notifyReward` call has occurred while the attacker holds shares.
+2. A vault operation (`deposit` or `requestWithdrawal`) triggers `_checkpoint`, which moves the attacker's pending rewards into `accrued[attacker]`.  The test `test_DepositCheckpointsEarlierEntitlement` demonstrates this path exactly.
+3. The attacker calls `claim()` any number of times thereafter. The `nonReentrant` guard blocks same-transaction re-entry but does nothing to prevent repeated calls across transactions.
+
+**Root cause:** `claim()` computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, updates `userIndex[msg.sender] = globalIndex` (stopping future `_pendingFor` growth), but never writes `accrued[msg.sender] = 0`. Every subsequent call therefore re-reads the original `accrued` value and transfers it again.
+
+```solidity
+// claim() as written — missing the critical line
+userIndex[msg.sender] = globalIndex;
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+// accrued[msg.sender] = 0;   ← ABSENT
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer (or equivalently before updating `userIndex`).
+
+---
+
+## HIGH
+
+### H-1 — `FixedPointMath.mulDiv()` uses unchecked intermediate product, enabling DoS on large values
+
+**File:** `src/libraries/FixedPointMath.sol`, `mulDiv()` (line 14)
+
+**What an attacker can do:** Cause a permanent, unrecoverable denial-of-service for a specific account's reward claims or share conversions. Once a user's `balanceOf * (globalIndex - userIndex)` product exceeds `2²⁵⁶ − 1`, all calls to `claimable()`, `_pendingFor()` and therefore `claim()` revert permanently for that account. The user can never recover accrued rewards without an owner-level intervention (there is none provided).
+
+**Conditions required:** The product `vault.balanceOf(account) × (globalIndex − userIndex[account])` overflows `uint256`. This becomes plausible when: (a) a user holds a large share balance and has not checkpointed for many reward notifications, or (b) the owner calls `notifyReward` with a large amount relative to a small `totalSupply`, causing `globalIndex` to jump by `amount × WAD / supply` in a single step (e.g., `amount = 1e40`, `supply = 1` → `globalIndex += 1e58`). `1e58 × balance` overflows for any balance above ~`1.16e19`.
+
+**Root cause:** `mulDiv(x, y, d)` computes `(x * y) / d` with no 512-bit intermediate. Solidity 0.8.x reverts on overflow, so there is no silent corruption, but the revert permanently bricks affected accounts.
+
+**Fix:** Implement a full 512-bit `mulDiv` (as in OpenZeppelin's `Math.mulDiv`) that avoids the intermediate overflow.
+
+---
+
+## MEDIUM
+
+### M-1 — `RewardDistributor.notifyReward()` is front-runnable, allowing reward sniping
+
+**File:** `src/rewards/RewardDistributor.sol`, `notifyReward()` (line 103)
+
+**What an attacker can do:** Capture a disproportionate fraction of each reward notification without providing meaningful economic service to the protocol. The attacker profits even when the vault's cooldown is short relative to the value at stake.
+
+**Conditions required:**
+1. The attacker observes a pending `notifyReward(amount)` transaction in the mempool.
+2. The attacker front-runs it with a large `deposit()`, increasing their share of `vault.totalSupply()`.
+3. After `notifyReward` settles, the attacker owns a large fraction of `globalIndex` growth.
+4. The attacker calls `requestWithdrawal` and, after the cooldown, `completeWithdrawal` to exit. As long as the reward value exceeds the withdrawal fee and the capital cost of locking funds for the cooldown period, the trade is profitable.
+
+**Root cause:** `notifyReward` snapshots `vault.totalSupply()` at the moment of execution to compute `globalIndex += amount × WAD / supply`. Any deposit that occurs before this snapshot increases the denominator but the attacker's numerator grows proportionally, not at cost.
+
+**Fix options:** Use a commit-reveal or time-locked reward schedule; snapshot supply at a block before the notification; or require a minimum staking duration before rewards can be claimed.
+
+### M-2 — `StakingVault.deposit()` updates state before the asset transfer (CEI violation)
+
+**File:** `src/core/StakingVault.sol`, `deposit()` (line 124)
+
+**What an attacker can do:** With a non-standard staking asset (ERC-777, callback-on-transfer, or fee-on-transfer token), the vault's accounting diverges from actual token balances. For a fee-on-transfer token, `totalAssets` is inflated above real holdings: if a 10%-fee token is deposited for 1000 units, `totalAssets` records 1000 but only 900 arrive, permanently overstating the share price for all future participants.
+
+**Conditions required:** The staking `asset` is not a plain ERC-20. Fee-on-transfer tokens cause silent accounting inflation on every deposit. Callback tokens (ERC-777 `tokensToSend`) would attempt re-entry, which the `nonReentrant` guard blocks, converting the attempt into a failed transaction rather than an exploit — but the guard is the only protection.
+
+**Root cause:** `totalAssets`, `totalSupply`, and `balanceOf[msg.sender]` are all updated before `asset.safeTransferFrom` is called. A pull of fewer tokens than declared goes undetected because the library only checks that the call did not revert.
+
+**Fix:** Move all state mutations to after `safeTransferFrom`, or — if the asset is a known plain ERC-20 — add an explicit comment and deployment check that non-standard assets are unsupported.
+
+---
+
+## LOW
+
+### L-1 — `Ownable2Step.transferOwnership()` accepts `address(0)` as `newOwner`
+
+**File:** `src/auth/Ownable2Step.sol`, `transferOwnership()` (line 30)
+
+**What an attacker can do:** No direct exploit — `acceptOwnership()` cannot be called from `address(0)`. However, a typo or UI bug by the current owner sets `pendingOwner = address(0)`, which could confuse off-chain monitoring into believing ownership renunciation is in progress, and suppresses the legitimate new-owner until `transferOwnership` is called again.
+
+**Conditions required:** Owner calls `transferOwnership(address(0))` accidentally.
+
+**Fix:** `require(newOwner != address(0), "OWNER_ZERO");` in `transferOwnership`.
+
+### L-2 — `StakingVault` constructor does not validate `cooldown_ > 0`
+
+**File:** `src/core/StakingVault.sol`, constructor (line 89)
+
+**What an attacker can do:** If deployed with `cooldown_ = 0`, withdrawal requests can be completed in the same block they are created. The queue provides no time for the protocol to respond to anomalous conditions (e.g., an exploit drain of `accrueYield` funds that just arrived). Combined with C-1, an attacker could deposit, trigger `checkpoint`, call `claim` repeatedly, and exit the vault immediately — all within a single block.
+
+**Conditions required:** Deployer passes `cooldown_ = 0`.
+
+**Fix:** `require(cooldown_ > 0, "COOLDOWN_ZERO");` in the constructor.
+
+### L-3 — `StakingVault.setGuardian()` allows setting guardian to `address(0)` without ceremony
+
+**File:** `src/core/StakingVault.sol`, `setGuardian()` (line 201)
+
+**What an attacker can do:** No direct exploit. However, the owner can silently remove the guardian role by setting it to `address(0)` without any event distinguishing this from a normal rotation. The `pause()` function still works correctly (owner can always pause), but the design intent of a separate guardian role is defeated without visibility.
+
+**Conditions required:** Owner calls `setGuardian(address(0))`.
+
+**Fix:** Either explicitly allow `address(0)` with a dedicated `removeGuardian()` function, or add a zero-address check if guardian-less operation is unintended.
+
+---
+
+## INFORMATIONAL
+
+### I-1 — `FixedPointMath.mulDiv` rounds down in all fee and conversion paths — consistent but implicit
+
+`convertToShares`, `convertToAssets`, fee computation in `completeWithdrawal`, and reward accounting all use the flooring `mulDiv`. Rounding in share accounting consistently favours the vault over the depositor (correct ERC-4626 convention). However, the reward accounting in `_pendingFor` also floors, meaning rounding errors accumulate in the distributor rather than in user balances. This is a common and acceptable trade-off but should be documented explicitly.
+
+### I-2 — `RewardDistributor.notifyReward()` reads supply from the vault at call time; not snapshotted
+
+Noted here separately from M-1: the `supply` used for index computation is a live read (`vault.totalSupply()`). There is no mechanism to take a snapshot at the end of a prior block, which makes same-block timing attacks trivially accessible on any chain with fast block times or MEV infrastructure.
+
+---
+
+## Summary Table
+
+| ID  | Severity | Contract | Function | Title |
+|-----|----------|----------|----------|-------|
+| C-1 | Critical | `RewardDistributor` | `claim` | `accrued` never zeroed — unlimited drain |
+| H-1 | High | `FixedPointMath` | `mulDiv` | Intermediate overflow causes permanent DoS |
+| M-1 | Medium | `RewardDistributor` | `notifyReward` | Front-running enables reward sniping |
+| M-2 | Medium | `StakingVault` | `deposit` | CEI violation; unsafe with non-standard assets |
+| L-1 | Low | `Ownable2Step` | `transferOwnership` | No zero-address check on `newOwner` |
+| L-2 | Low | `StakingVault` | constructor | Zero cooldown accepted without validation |
+| L-3 | Low | `StakingVault` | `setGuardian` | Zero-address silently removes guardian |
+
+The single most urgent fix is **C-1**: add `accrued[msg.sender] = 0;` to `RewardDistributor.claim()`. Without it, any staker whose rewards have been checkpointed can empty the distributor in a handful of transactions.

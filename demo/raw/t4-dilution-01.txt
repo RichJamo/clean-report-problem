@@ -1,0 +1,188 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            01
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:57:39Z
+# duration-ms:    273335
+# num-turns:      20
+# context-tokens: 195099
+# output-tokens:  15092
+# cost-usd:       0.401037
+# is-error:       False
+# session-id:     253dac2d-6b4b-4da5-8ef6-bb3ac47fde29
+# ---- agent output below this line ----
+I have completed a thorough review of all source files. Here is the audit report.
+
+---
+
+# Security Audit Report — StakingVault System
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/FixedPointMath.sol`
+
+---
+
+## CRITICAL — 1 Finding
+
+### C-1: `RewardDistributor.claim()` never clears `accrued[msg.sender]` — reward pool fully drainable
+
+**File:** `src/rewards/RewardDistributor.sol:119–129`  
+**Function:** `claim()`
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // ← updated
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    emit Claimed(msg.sender, amount);
+    // ← accrued[msg.sender] is never set to 0
+}
+```
+
+**What an attacker can do:** Any account with a non-zero `accrued` balance can call `claim()` in a loop and receive the same amount on every call until the distributor's `rewardToken` balance is exhausted.
+
+**How it arises:** `accrued[account]` is written by `checkpoint()` and read by both `claimable()` and `claim()`. After a successful `claim()`, `userIndex[msg.sender]` is advanced to `globalIndex`, causing `_pendingFor()` to return 0 on subsequent calls — but `accrued[msg.sender]` retains its old value. On each repeat call, `amount = accrued[msg.sender] + 0`, which is still non-zero, so the `NothingToClaim` guard never fires, and another transfer is issued.
+
+**Conditions required:**
+1. The `RewardDistributor` has been wired to the vault (normal post-deployment step).
+2. At least one `notifyReward()` call has been made, so `globalIndex > 0`.
+3. The attacker has had a share balance checkpointed at least once (i.e., they staked before a notification), giving them a non-zero `accrued` entry.
+4. The contract holds enough `rewardToken` to cover repeated transfers (which it always will, since rewards are pushed in by the owner).
+
+**Fix:** Add `accrued[msg.sender] = 0;` before or immediately after computing `amount`.
+
+---
+
+## MEDIUM — 1 Finding
+
+### M-1: `StakingVault.deposit()` updates state before pulling tokens (CEI violation)
+
+**File:** `src/core/StakingVault.sol:124–139`  
+**Function:** `deposit()`
+
+```solidity
+function deposit(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
+    if (assets == 0) revert ZeroAmount();
+    _checkpoint(msg.sender);          // external call #1
+    shares = convertToShares(assets);
+    if (shares == 0) revert ZeroShares();
+    totalAssets += assets;            // ← state mutated here
+    totalSupply += shares;
+    balanceOf[msg.sender] += shares;
+    asset.safeTransferFrom(msg.sender, address(this), assets);  // external call #2
+    emit Deposited(msg.sender, assets, shares);
+}
+```
+
+**What an attacker can do:** If the staked asset supports pre-transfer sender callbacks (e.g. ERC-777 `tokensToSend`), the callback fires while the vault has already credited the depositor with shares and incremented `totalAssets` and `totalSupply`, but before any tokens have arrived. At that moment the vault is insolvent: it has issued shares backed by assets that do not yet exist in the contract.
+
+Although the `nonReentrant` guard prevents the callback from calling back into any other `nonReentrant`-protected vault function, the callback can interact with external contracts that read vault state (`totalAssets`, `balanceOf`, `convertToAssets`), leading to price-oracle manipulation or integration bugs in downstream systems that consume vault view functions.
+
+**Conditions required:** The asset token implements a pre-transfer callback executed in the sender's context (e.g. ERC-777). The `nonReentrant` guard eliminates re-entry into the vault itself but does not prevent cross-contract read of the inflated state.
+
+**Fix:** Move the `safeTransferFrom` call before the storage writes, or at minimum before the balance/supply increments, in accordance with the Checks-Effects-Interactions pattern.
+
+---
+
+## LOW — 3 Findings
+
+### L-1: `FixedPointMath.mulDiv()` lacks 512-bit intermediate arithmetic — DoS via overflow revert
+
+**File:** `src/libraries/FixedPointMath.sol:14–16`  
+**Function:** `mulDiv()`
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;
+}
+```
+
+The intermediate product `x * y` is computed in 256 bits. Solidity 0.8.x causes an unchecked revert on overflow. Every core conversion path (`convertToShares`, `convertToAssets`, the reward index update in `notifyReward`, and `_pendingFor`) passes through this function. If either operand exceeds `2^128`, the multiply overflows for any non-trivial second operand. Specifically, `assets.mulDiv(totalSupply, totalAssets)` in `convertToShares` will permanently revert once `assets * totalSupply > 2^256`, at which point deposits are bricked.
+
+**What an attacker can do:** Cause the vault to become permanently non-functional for deposits and share-price queries by driving `totalSupply` high enough — or simply wait for organic growth in a high-TVL deployment.
+
+**Conditions required:** `totalSupply` (or `totalAssets`) exceeds roughly `2^128` wei, which requires approximately 3.4 × 10²⁰ tokens with 18 decimals — extreme but reachable in high-supply token deployments.
+
+**Fix:** Replace with a full 512-bit mulDiv implementation (e.g. OpenZeppelin `Math.mulDiv`).
+
+---
+
+### L-2: `Ownable2Step.transferOwnership()` accepts `address(0)` as pending owner
+
+**File:** `src/auth/Ownable2Step.sol:30–33`  
+**Function:** `transferOwnership()`
+
+```solidity
+function transferOwnership(address newOwner) external onlyOwner {
+    pendingOwner = newOwner;
+    emit OwnershipTransferStarted(owner, newOwner);
+}
+```
+
+There is no `require(newOwner != address(0))` guard. An owner who accidentally passes the zero address queues a renunciation. Since `acceptOwnership` requires `msg.sender == pendingOwner` and `address(0)` can never be a sender, the transfer can never complete — but the pending-ownership slot is occupied by the zero address and the `OwnershipTransferStarted` event misleads off-chain monitors. The owner can overwrite it with a second call, but an erroneous call is still a foot-gun.
+
+**Conditions required:** Owner accidentally (or maliciously) passes `address(0)`.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` at the top of `transferOwnership()`.
+
+---
+
+### L-3: `StakingVault.setGuardian()` accepts `address(0)`, silently removing emergency pause capability
+
+**File:** `src/core/StakingVault.sol:201–204`  
+**Function:** `setGuardian()`
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;
+}
+```
+
+Setting `guardian = address(0)` is accepted without revert. The `pause()` function then requires `msg.sender == owner`, which means the secondary, faster pause path (intended for an on-call operator to react quickly to an exploit) is silently disabled. If the owner key is unavailable at incident time, the vault cannot be paused.
+
+**Conditions required:** Owner calls `setGuardian(address(0))`, either by mistake or during a guardian rotation where the new address is not yet ready.
+
+**Fix:** Add `require(newGuardian != address(0), "GUARDIAN_ZERO");`, or explicitly allow `address(0)` only through a dedicated `removeGuardian()` function that documents the intent.
+
+---
+
+## INFORMATIONAL — 2 Findings
+
+### I-1: Reentrancy guard uses 0→1→0 pattern (cold SSTORE on every call)
+
+**File:** `src/core/StakingVault.sol:77–82`, `src/rewards/RewardDistributor.sol:58–63`  
+**Function:** `nonReentrant` modifier in both contracts
+
+Both contracts initialize `_entered` to 0 (default), set it to 1 on entry, and reset it to 0 on exit. Every protected call therefore pays a cold SSTORE (20,000 gas) on entry and a warm SSTORE on exit. The standard mitigation is to initialize `_entered = 1` at deployment and toggle between 1 and 2, keeping all writes warm (100 gas each).
+
+This is a gas inefficiency, not a security bug, but it makes protected functions roughly 15,000 gas more expensive per call than necessary.
+
+---
+
+### I-2: Fee recipient is not locked at request time — inconsistency with fee-rate lock
+
+**File:** `src/core/StakingVault.sol:166–178`  
+**Function:** `completeWithdrawal()`
+
+ADR 0005 states that the fee *rate* is captured at request time so a later change cannot be applied retroactively. The fee *recipient*, however, is read from `feeController.feeRecipient()` at completion time. If the owner updates the recipient between a user's `requestWithdrawal` and `completeWithdrawal`, the fee flows to the new address rather than the one in place when the user committed to the exit. This is a latent inconsistency and could surprise integrators expecting all exit terms to be fully locked.
+
+---
+
+## Summary Table
+
+| ID  | Severity    | Contract                  | Function               | Issue                                           |
+|-----|-------------|---------------------------|------------------------|-------------------------------------------------|
+| C-1 | Critical    | RewardDistributor.sol     | `claim()`              | `accrued` never zeroed; full reward pool drainable |
+| M-1 | Medium      | StakingVault.sol          | `deposit()`            | CEI violation; state updated before token pull |
+| L-1 | Low         | FixedPointMath.sol        | `mulDiv()`             | No 512-bit arithmetic; overflow DoS at high TVL |
+| L-2 | Low         | Ownable2Step.sol          | `transferOwnership()`  | `address(0)` accepted as pending owner         |
+| L-3 | Low         | StakingVault.sol          | `setGuardian()`        | `address(0)` accepted, removes emergency pause |
+| I-1 | Info        | StakingVault, RewardDistributor | `nonReentrant`   | 0/1 pattern pays cold SSTORE on every call     |
+| I-2 | Info        | StakingVault.sol          | `completeWithdrawal()` | Fee recipient not locked at request time        |

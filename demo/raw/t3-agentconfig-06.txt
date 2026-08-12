@@ -1,0 +1,173 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3-agentconfig
+# run:            06
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:19:49Z
+# duration-ms:    455050
+# num-turns:      15
+# context-tokens: 156317
+# output-tokens:  26212
+# cost-usd:       0.58139925
+# is-error:       False
+# session-id:     3c52157f-f2c4-4adc-be9e-0c62613a9ec5
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** All contracts in `src/` (`StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `SafeTransferLib`, `FixedPointMath`)
+**Compiler:** Solidity 0.8.24
+**Date:** 2026-08-12
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()`: `accrued[msg.sender]` is never zeroed, enabling unlimited reward drainage
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()`, lines 119–129
+
+**What an attacker can do:** Repeatedly call `claim()` in separate transactions to drain the entire reward token balance of the contract, claiming the same `accrued` amount over and over.
+
+**Conditions required:**
+1. Rewards must have been notified at least once while the attacker held shares (`notifyReward` was called with `totalSupply > 0`).
+2. The vault must have called `checkpoint(attacker)` at least once *before* the attacker's first `claim()` — this happens automatically any time the attacker calls `deposit()` or `requestWithdrawal()` while rewards exist.
+
+**Root cause:** The `claim()` function computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, transfers `amount`, and sets `userIndex[msg.sender] = globalIndex` (which makes `_pendingFor` return 0 going forward). However, it never sets `accrued[msg.sender] = 0`. On every subsequent call, `_pendingFor` returns 0, but `accrued[msg.sender]` still holds the old checkpointed value, so `amount` is non-zero and the transfer executes again.
+
+**Proof-of-concept trace:**
+```
+// Setup: Alice has 100 shares, owner calls notifyReward(100).
+// globalIndex = 1e18.
+
+// Alice calls deposit(1) — vault calls checkpoint(alice) first.
+// checkpoint: pending = 100 * 1e18 / 1e18 = 100
+//   accrued[alice] = 100, userIndex[alice] = 1e18
+
+// Call 1: alice.claim()
+//   amount = accrued[alice] + _pending = 100 + 0 = 100
+//   Transfer 100 reward tokens to Alice.
+//   userIndex[alice] = globalIndex = 1e18
+//   accrued[alice] is STILL 100 ← BUG
+
+// Call 2: alice.claim()
+//   amount = accrued[alice] + _pending = 100 + 0 = 100
+//   Transfer 100 more reward tokens — drains contract.
+// Repeat indefinitely.
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` in `claim()` before or immediately after reading `amount`.
+
+---
+
+## Medium
+
+### M-1 — `FixedPointMath.mulDiv()`: No 512-bit intermediate arithmetic; large inputs revert unexpectedly
+
+**File:** `src/libraries/FixedPointMath.sol`, `mulDiv()`, line 14
+
+**What an attacker can do:** Cause `deposit()`, `requestWithdrawal()`, and `notifyReward()` to revert with an overflow panic for sufficiently large token amounts, creating a denial-of-service for large depositors.
+
+**Conditions required:** The product of the two multiplicands must exceed `type(uint256).max` (~1.15 × 10⁷⁷). The most reachable path is `convertToShares`: `assets * totalSupply` overflows when both values are large simultaneously. For a token with 18 decimals, this requires assets and supply each to exceed ~1.34 × 10³⁸ raw units (~1.34 × 10²⁰ whole tokens). This is implausible for most tokens but possible for tokens with very high supply and no decimal scaling.
+
+**Root cause:** The implementation is `(x * y) / d`. Unlike OpenZeppelin's `Math.mulDiv`, which uses 512-bit intermediate arithmetic to avoid overflow, this implementation relies on the Solidity 0.8.x arithmetic guard, which reverts instead of wrapping. There is no fallback.
+
+**Fix:** Replace the internal `mulDiv` with a 512-bit implementation (e.g., the Remco Bloemen / OpenZeppelin algorithm), or constrain inputs at the caller level.
+
+---
+
+### M-2 — `RewardDistributor.notifyReward()`: Reward tokens silently stranded when `amount * WAD < totalSupply`
+
+**File:** `src/rewards/RewardDistributor.sol`, `notifyReward()`, line 112
+
+**What an attacker can do:** This is not attacker-triggered, but the owner can inadvertently lose reward funds permanently. When `amount * WAD / supply` truncates to 0, the reward tokens are transferred into the contract but `globalIndex` does not increase. Those tokens are attributed to no one and are permanently unclaimable.
+
+**Conditions required:** The reward amount (scaled by WAD = 1e18) must be smaller than the total share supply. For example: `supply = 2e24` shares and `amount = 1` token (1e18 raw units); `1e18 * 1e18 / 2e24 = 1e36 / 2e24 = 5e11 > 0`, so this specific example is fine. But with `supply = 2e37` and `amount = 1e18`: `1e36 / 2e37 = 0`. The point is that for very large supplies and small reward notifications, the index increment floors to zero.
+
+**Fix:** Revert in `notifyReward` when the computed index increment is zero (`require(increment != 0, "DUST_REWARD")`), preventing the tokens from being transferred when they would be unattributable.
+
+---
+
+## Low
+
+### L-1 — `StakingVault.requestWithdrawal()`: Dust shares burn for zero assets
+
+**File:** `src/core/StakingVault.sol`, `requestWithdrawal()`, line 151
+
+**What an attacker can do:** Not exploitable by a third party, but a user who holds very few shares relative to the share-price can call `requestWithdrawal(tinyAmount)`, have `convertToAssets` round down to 0, burn their shares, and receive nothing. `totalAssets` is unchanged (subtracts 0), but `totalSupply` decreases — very slightly inflating the share price at the caller's expense.
+
+**Conditions required:** `shares * totalAssets / totalSupply < 1`, i.e., the requested share count is negligible relative to the exchange rate. Requires dust-scale share amounts.
+
+**Fix:** Add `require(assets != 0, "ZERO_ASSETS")` after computing `assets = convertToAssets(shares)`.
+
+---
+
+### L-2 — `StakingVault.completeWithdrawal()`: Fee recipient resolved at settlement time, not request time
+
+**File:** `src/core/StakingVault.sol`, `completeWithdrawal()`, line 173
+
+**What an attacker can do:** This requires a compromised or colluding owner. If the owner changes `feeRecipient` in `FeeController` between when a user's withdrawal request is created and when it is settled, fees from that request are redirected to the new recipient. The exit fee rate (`feeBps`) is correctly frozen at request time (stored in the queue), but the destination address is not.
+
+**Conditions required:** Owner calls `FeeController.setFeeRecipient()` during a user's cooldown window. The user's payout is unaffected; only the fee destination changes.
+
+**Fix:** Store the fee recipient address in the `WithdrawalQueue.Request` struct at enqueue time, alongside `feeBps`.
+
+---
+
+### L-3 — `Ownable2Step.transferOwnership()`: No zero-address guard on `newOwner`
+
+**File:** `src/auth/Ownable2Step.sol`, `transferOwnership()`, line 30
+
+**What an attacker can do:** A compromised or inattentive owner can call `transferOwnership(address(0))`. This sets `pendingOwner = address(0)`. Since `address(0)` cannot call `acceptOwnership()`, the transfer never completes, leaving the current owner still in control — but also leaving `pendingOwner` in a confusing state. There is no immediate loss of control, but a follow-up call to `transferOwnership` with a correct address fixes it.
+
+**Conditions required:** Owner calls `transferOwnership(address(0))` (intentionally or by mistake).
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO")` in `transferOwnership`.
+
+---
+
+### L-4 — `StakingVault.setRewardDistributor()`: No upgrade path if distributor is set incorrectly
+
+**File:** `src/core/StakingVault.sol`, `setRewardDistributor()`, lines 194–199
+
+**What an attacker can do:** This is a design limitation. If the owner sets a buggy or malicious `rewardDistributor`, there is no way to replace it. A malicious distributor could revert on every `checkpoint()` call, which would cause all future `deposit()` and `requestWithdrawal()` calls to revert — effectively bricking the vault's deposit and withdrawal-request functions permanently (exits already in the queue via `completeWithdrawal` are unaffected).
+
+**Conditions required:** Owner sets a distributor that reverts on `checkpoint()`.
+
+**Fix:** Consider allowing the owner to replace the distributor under strict conditions (e.g., only when `totalSupply == 0`, or add an emergency override with a timelock). Alternatively, document clearly that the distributor must be audited and tested before being set.
+
+---
+
+## Informational
+
+### I-1 — `nonReentrant` uses 0/1 sentinel values instead of 1/2, incurring unnecessary cold SSTORE cost
+
+**Files:** `src/core/StakingVault.sol` line 77; `src/rewards/RewardDistributor.sol` line 58
+
+The guard initializes `_entered` to 0 and transitions 0→1 on entry, 1→0 on exit. The first call to any `nonReentrant` function writes a storage slot from its zero initial value, costing ~20,000 gas instead of the ~5,000 gas paid by the standard 1/2 pattern (where the slot is initialized to 1 at deployment time). No security impact; pure gas efficiency concern.
+
+**Fix:** Initialize `_entered = 1` in the constructor (or as a constant initial value) and check/set between 1 and 2.
+
+---
+
+## Summary Table
+
+| ID | Severity | Contract | Function | Title |
+|----|----------|----------|----------|-------|
+| C-1 | **Critical** | `RewardDistributor` | `claim()` | `accrued` never zeroed → unlimited drain |
+| M-1 | Medium | `FixedPointMath` | `mulDiv()` | Overflow on large intermediate products |
+| M-2 | Medium | `RewardDistributor` | `notifyReward()` | Dust rewards silently stranded |
+| L-1 | Low | `StakingVault` | `requestWithdrawal()` | Dust shares burn for zero assets |
+| L-2 | Low | `StakingVault` | `completeWithdrawal()` | Fee recipient not frozen at request time |
+| L-3 | Low | `Ownable2Step` | `transferOwnership()` | `address(0)` accepted as pending owner |
+| L-4 | Low | `StakingVault` | `setRewardDistributor()` | No recovery path for bad distributor |
+| I-1 | Info | Both | `nonReentrant` modifier | 0/1 guard wastes gas on cold SSTORE |
+
+---
+
+**The only issue requiring immediate remediation before deployment is C-1.** A single line — `accrued[msg.sender] = 0;` — is missing from `claim()`. Without it, any staker who has ever had a `checkpoint` call (i.e., any staker who has deposited or requested a withdrawal while rewards were outstanding) can drain the entire reward token balance of the distributor in a series of ordinary `claim()` transactions.

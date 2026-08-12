@@ -1,0 +1,154 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            07
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:31:54Z
+# duration-ms:    332121
+# num-turns:      18
+# context-tokens: 125281
+# output-tokens:  18475
+# cost-usd:       0.39796995
+# is-error:       False
+# session-id:     986ab7f2-8429-46a3-9e10-1c37e8b3105c
+# ---- agent output below this line ----
+Now I have a thorough understanding of all the contracts. Let me compile the full security audit report.
+
+---
+
+# Security Audit Report — StakingVault Suite
+
+**Scope**: `src/` — `StakingVault`, `WithdrawalQueue`, `FeeController`, `RewardDistributor`, `Ownable2Step`, and all libraries.  
+**Compiler**: Solidity 0.8.24
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()` never zeroes `accrued[msg.sender]`, enabling unlimited re-claims
+
+**File**: `src/rewards/RewardDistributor.sol`, function `claim()` (lines 119–129)
+
+**What an attacker can do**: Any account whose `accrued` balance is non-zero can call `claim()` repeatedly to withdraw the same amount of reward tokens over and over until the distributor's token balance is empty. The drain is limited only by how many reward tokens are held in the contract at the time.
+
+**Conditions required**:
+1. `accrued[attacker]` must be non-zero. This happens whenever `checkpoint` is called for the account while it has a positive share balance and `globalIndex > userIndex[account]`. In practice this occurs on any second deposit or any withdrawal request after a `notifyReward`.
+2. The distributor must hold enough reward tokens to pay at least one additional claim. Because the attack loop can run across many blocks, even intermittent top-ups via `notifyReward` are extracted.
+
+**Root cause**: `claim()` reads `accrued[msg.sender]`, pays it out, and advances `userIndex[msg.sender]` to the current `globalIndex`—but it never resets `accrued[msg.sender]` to 0. The fix is to add `accrued[msg.sender] = 0;` before or alongside the transfer.
+
+```solidity
+// current (vulnerable)
+amount = accrued[msg.sender] + _pendingFor(msg.sender);
+…
+userIndex[msg.sender] = globalIndex;   // pending protected; accrued is NOT cleared
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+
+// required fix
+accrued[msg.sender] = 0;              // ← missing line
+userIndex[msg.sender] = globalIndex;
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+```
+
+---
+
+## Medium
+
+### M-1 — `FixedPointMath.mulDiv` uses unchecked intermediate multiplication
+
+**File**: `src/libraries/FixedPointMath.sol`, function `mulDiv()` (line 14)
+
+**What an attacker can do**: An attacker cannot extract funds through this path, but they can cause targeted denial-of-service. If `x * y` overflows `uint256`, Solidity 0.8.x reverts rather than wrapping. This can make `deposit`, `requestWithdrawal`, `convertToShares`, `convertToAssets`, and `notifyReward` permanently uncallable for large-but-legitimate inputs.
+
+**Conditions required**: The product `x * y` must exceed `type(uint256).max ≈ 1.16 × 10⁷⁷`. For the most sensitive call site—`notifyReward`, which computes `amount * 1e18`—this requires `amount > 1.16 × 10⁵⁹`. With 18-decimal tokens that means notifying more than ~1.16 × 10⁴¹ tokens in a single call. For `convertToShares`/`convertToAssets`, `assets * totalSupply` or `shares * totalAssets` must reach the same threshold. Under realistic token supplies this is not reachable today, but the absence of full-precision `mulDiv` (e.g., the Uniswap 512-bit algorithm) is a latent risk if supply or index values grow unexpectedly.
+
+---
+
+### M-2 — `deposit` has no minimum-shares (slippage) parameter
+
+**File**: `src/core/StakingVault.sol`, function `deposit()` (lines 124–139)
+
+**What an attacker can do**: A searcher can sandwich a deposit transaction. They front-run with a large `accrueYield` call (owner-only, so not directly applicable) or, in a multi-owner or compromised-owner scenario, inflate `totalAssets` just before the victim's deposit, causing the victim to receive far fewer shares than the quoted price. Without a minimum-shares floor the user has no on-chain protection.
+
+**Conditions required**: In the current design `accrueYield` is owner-only, which limits who can move the price. The risk is relevant when ownership or guardian keys are shared, if `accrueYield` authorization is widened, or across reorganizations on low-security chains. Adding a `minShares` parameter and reverting if `shares < minShares` eliminates the risk entirely.
+
+---
+
+## Low
+
+### L-1 — `WithdrawalQueue` cooldown can be constructed as zero
+
+**File**: `src/core/WithdrawalQueue.sol`, constructor (line 50); `src/core/StakingVault.sol`, constructor (line 101)
+
+**What an attacker can do**: With a zero-second cooldown `unlockAt = block.timestamp`, so `completeWithdrawal` succeeds in the same block as `requestWithdrawal`. A depositor can stake, collect rewards via a sandwich, and exit—all atomically. This weakens the economic security of any protocol built on top that assumes exit delays protect the vault's TVL.
+
+**Conditions required**: The deployer must pass `cooldown_ = 0`. There is no on-chain validation that prevents it. Adding `require(cooldown_ > 0, "COOLDOWN_ZERO")` (or a minimum floor) removes the risk.
+
+---
+
+### L-2 — `Ownable2Step.transferOwnership` accepts `address(0)` as nominee
+
+**File**: `src/auth/Ownable2Step.sol`, function `transferOwnership()` (line 30)
+
+**What an attacker can do**: The current owner can nominate `address(0)` as `pendingOwner`. Because no private key controls `address(0)`, `acceptOwnership` can never be called. The current owner remains in control, but the `OwnershipTransferStarted` event is emitted with `address(0)`, which could mislead off-chain monitors or governance tools into believing ownership is being renounced when it is not.
+
+**Conditions required**: Owner calls `transferOwnership(address(0))` either by mistake or to deceive observers. Validating `newOwner != address(0)` in `transferOwnership` fixes this and is consistent with the zero-address guard already applied in the constructor.
+
+---
+
+### L-3 — Fee recipient is resolved at completion time, not at request time
+
+**File**: `src/core/StakingVault.sol`, function `completeWithdrawal()` (line 173)
+
+**What an attacker can do**: The exit fee rate (`feeBps`) is correctly captured at request time per the documented invariant. However, `feeController.feeRecipient()` is read fresh at completion time. If the owner changes the fee recipient between request and settlement, the fee is silently redirected to the new address—contrary to what a user might expect when they locked in their fee terms. An owner acting maliciously could redirect fees to an arbitrary address.
+
+**Conditions required**: Owner must call `FeeController.setFeeRecipient` during the cooldown window of a pending request. The fix is either to snapshot `feeRecipient` in the `WithdrawalQueue.Request` struct alongside `feeBps`, or to document explicitly that only the fee rate is locked, not the destination.
+
+---
+
+### L-4 — `completeWithdrawal` reverts if the fee recipient contract rejects the token
+
+**File**: `src/core/StakingVault.sol`, function `completeWithdrawal()` (lines 172–173)
+
+**What an attacker can do**: If `feeRecipient` is a smart contract whose receive/fallback reverts on the staked asset, then `asset.safeTransfer(feeController.feeRecipient(), fee)` reverts. This blocks every pending withdrawal for the duration that `feeRecipient` is misconfigured, because the fee transfer runs before the user's payout. The user's funds are locked in the queue even though the cooldown has elapsed.
+
+**Conditions required**: `feeRecipient` must be a contract that reverts on token receipt (e.g., a contract that has not implemented `transfer` handling), and `fee != 0` (i.e., `feeBps > 0`). The risk is highest immediately after a `setFeeRecipient` call with an untested address. A mitigation is to use a pull-based fee accounting pattern, or to validate the fee recipient accepts the token before setting.
+
+---
+
+## Informational
+
+### I-1 — Cross-contract reentrancy path exists but is not currently exploitable
+
+**Files**: `src/rewards/RewardDistributor.sol` `claim()` and `src/core/StakingVault.sol`
+
+If `rewardToken` is an ERC-777 or a token with transfer hooks, a malicious recipient can re-enter `StakingVault` (e.g., call `deposit`) during the `safeTransfer` in `claim()`. Because `StakingVault._entered` is 0 at that moment (no vault function is on the call stack), the vault accepts the call. The inner `deposit` triggers `checkpoint`, but because `userIndex[attacker]` was already advanced to `globalIndex` before the transfer, `_pendingFor` returns 0 and no additional rewards are minted. The critical bug (C-1) already provides a simpler non-reentrant drain path, but if C-1 is fixed, care must be taken that the fix does not introduce a new CEI violation that this reentrancy path could exploit.
+
+### I-2 — `FixedPointMath.mulDiv` rounds down in both `convertToShares` and fee computation
+
+The floor rounding in `mulDiv` is intentional and documented (favours the vault on deposits, favours the user on fee computation). However, the same library is available with `mulDivUp` and neither the rounding direction policy nor which direction each site uses is documented in code comments. Future contributors may choose the wrong variant.
+
+### I-3 — `totalClaimed` can exceed `totalNotified` if C-1 is exploited
+
+`totalClaimed` is incremented by the full claimed amount including the portion sourced from a stale `accrued` balance. If the critical bug (C-1) is triggered, `totalClaimed` becomes a meaningless accounting figure and off-chain tooling that relies on `totalNotified - totalClaimed` to estimate undistributed reserves will report a negative (underflow-reverted) or incorrect balance.
+
+---
+
+## Summary Table
+
+| ID | Severity | Contract | Function | Finding |
+|----|----------|----------|----------|---------|
+| C-1 | Critical | `RewardDistributor` | `claim` | `accrued[msg.sender]` never zeroed; unlimited re-drain |
+| M-1 | Medium | `FixedPointMath` | `mulDiv` | Overflow DoS for very large intermediate products |
+| M-2 | Medium | `StakingVault` | `deposit` | No minimum-shares parameter; vulnerable to sandwich |
+| L-1 | Low | `WithdrawalQueue` | constructor | Zero cooldown accepted; allows atomic deposit-withdraw |
+| L-2 | Low | `Ownable2Step` | `transferOwnership` | `address(0)` nominee emits misleading event |
+| L-3 | Low | `StakingVault` | `completeWithdrawal` | Fee recipient not locked at request time |
+| L-4 | Low | `StakingVault` | `completeWithdrawal` | Bad fee recipient blocks all queue completions |
+| I-1 | Info | `RewardDistributor` | `claim` | Cross-contract reentrant path via ERC-777 reward token |
+| I-2 | Info | `FixedPointMath` | `mulDiv` | Rounding direction policy undocumented at call sites |
+| I-3 | Info | `RewardDistributor` | `claim` | `totalClaimed` corrupted under C-1 exploitation |

@@ -1,0 +1,165 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3-agentconfig
+# run:            08
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:32:21Z
+# duration-ms:    316558
+# num-turns:      14
+# context-tokens: 95063
+# output-tokens:  18455
+# cost-usd:       0.42670060000000004
+# is-error:       False
+# session-id:     ad53c908-ffaf-4f7e-886c-a15ae0899005
+# ---- agent output below this line ----
+I have all the information I need. Here is the complete security audit report.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Codebase:** `src/` (StakingVault, RewardDistributor, FeeController, WithdrawalQueue, Ownable2Step, FixedPointMath, SafeTransferLib)
+**Compiler:** Solidity 0.8.24
+**Date:** 2026-08-12
+
+---
+
+## [CRITICAL-1] `RewardDistributor::claim` — `accrued` is never cleared, enabling unlimited reward draining
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()`, lines 119–129
+
+**What an attacker can do:** Any user whose `accrued[account]` is non-zero can call `claim()` in a loop and receive the same amount on every iteration, draining the entire reward token balance of the distributor.
+
+**Root cause:** The function reads `accrued[msg.sender]` into `amount` and transfers it, but never sets `accrued[msg.sender] = 0`. `userIndex[msg.sender]` is updated (so `_pendingFor` returns 0 on subsequent calls), but the already-folded `accrued` balance is left intact.
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // ← clears pending only
+    totalClaimed += amount;
+    rewardToken.safeTransfer(msg.sender, amount);
+    // accrued[msg.sender] is never zeroed ← bug
+}
+```
+
+**Conditions required:**
+1. At least one `notifyReward` call has occurred while the attacker held a non-zero share balance.
+2. The vault subsequently called `checkpoint(attacker)` (triggered automatically by any `deposit` or `requestWithdrawal` by the attacker). This folds the earned rewards into `accrued[attacker]`.
+3. The attacker calls `claim()` once (receives correct amount), then calls `claim()` again and again — each subsequent call pays the same `accrued` value until the contract's reward token balance is exhausted.
+
+**Concrete example:**
+- Alice stakes 100 shares. Owner notifies 40 reward tokens → `globalIndex = 0.4e18`.
+- Alice calls `deposit` (any amount), triggering `_checkpoint(Alice)`: `accrued[Alice] = 40e18`, `userIndex[Alice] = globalIndex`.
+- Alice calls `claim()`: receives 40 tokens, `userIndex` already equals `globalIndex`, `accrued[Alice]` is still 40e18.
+- Alice calls `claim()` again: `_pendingFor = 0`, but `accrued[Alice] = 40e18` → another 40 tokens. Repeat until drained.
+
+**Fix:** Add `accrued[msg.sender] = 0;` before (or immediately after) computing `amount`.
+
+---
+
+## [HIGH-1] `RewardDistributor::notifyReward` — Reward tokens permanently locked on precision underflow
+
+**File:** `src/rewards/RewardDistributor.sol`, `notifyReward()`, lines 103–114
+
+**What an attacker can do:** An operator (or a legitimate but careless owner) can make a `notifyReward` call that permanently locks the transferred reward tokens in the contract. No user will ever be able to claim them.
+
+**Root cause:** `rewardToken.safeTransferFrom` executes before the index is updated. The index increment `amount.mulDiv(WAD, supply)` uses floor division. If `amount * 1e18 < supply`, the result rounds to zero — `globalIndex` does not change — but the tokens have already been deposited.
+
+```solidity
+rewardToken.safeTransferFrom(msg.sender, address(this), amount);  // tokens arrive
+totalNotified += amount;
+globalIndex += amount.mulDiv(FixedPointMath.WAD, supply);          // rounds to 0 → no index change
+```
+
+**Conditions required:**
+- `amount × 1e18 < totalSupply` at the time of the call.
+- For example: 1 000 000 shares outstanding → any notification of fewer than 1 000 tokens (10^3) rounds to zero. The tokens are transferred in but can never be claimed.
+
+**Fix:** Either revert when the computed index increment is zero (`require(increment != 0, "DUST_REWARD")`), or accumulate a `pendingDust` balance and fold it into the next sufficiently large notification.
+
+---
+
+## [HIGH-2] `FixedPointMath::mulDiv` — Intermediate multiplication overflow causes permanent DoS
+
+**File:** `src/libraries/FixedPointMath.sol`, `mulDiv()`, line 14
+
+**What an attacker can do:** Trigger a permanent, unrecoverable revert for specific accounts in `claim()`, `deposit()`, `requestWithdrawal()`, or `completeWithdrawal()`, effectively bricking those operations.
+
+**Root cause:** The implementation is `(x * y) / d`. In Solidity 0.8.x, if `x * y` exceeds `2^256 − 1`, the multiplication reverts even when the true mathematical result would fit in a `uint256`. There is no 512-bit intermediate or Mulmod trick.
+
+Affected call sites:
+- `_pendingFor`: `vault.balanceOf(account).mulDiv(delta, WAD)`. If balance is large and the reward index has grown substantially, `balance * delta` can overflow.
+- `convertToShares` / `convertToAssets`: `assets.mulDiv(supply, totalAssets)`. With a high share price and large deposit amounts, `assets * supply` can overflow.
+
+**Conditions required:**
+- `x * y > 2^256 − 1`. Achievable when: a single account holds a very large share balance (e.g., near `2^128`), or when `globalIndex` has grown significantly due to many `notifyReward` calls with small supply. An attacker who can manipulate `supply` at notification time (by exiting most shares) can inflate `globalIndex` rapidly.
+
+**Fix:** Replace `mulDiv` with a full 512-bit multiply-then-divide such as Solady's `FullMath.mulDiv` or the Uniswap V3 implementation, which avoids the intermediate overflow.
+
+---
+
+## [MEDIUM-1] `StakingVault::deposit` / `accrueYield` — Fee-on-transfer tokens cause silent insolvency
+
+**File:** `src/core/StakingVault.sol`, `deposit()` line 124, `accrueYield()` line 183
+
+**What an attacker can do:** If the `asset` token deducts a fee on transfer, `totalAssets` will be inflated relative to actual token holdings. Eventually, later withdrawers cannot be paid because the vault believes it holds more than it does. The last users to withdraw find the contract insolvent.
+
+**Root cause:** Both functions increment `totalAssets` by the nominal `assets` parameter, but `safeTransferFrom` may actually deliver `assets − fee` tokens:
+
+```solidity
+totalAssets += assets;                                         // ← credits full amount
+asset.safeTransferFrom(msg.sender, address(this), assets);    // ← receives less
+```
+
+**Conditions required:**
+- The deployed `asset` token charges a transfer fee (e.g., some rebasing or tax tokens).
+- No code-level guard prevents deploying the vault with such a token.
+
+**Fix:** Measure the actual balance change around the transfer (`post − pre`) and use that value to update `totalAssets`, or document clearly that fee-on-transfer tokens are unsupported and add a constructor-time check.
+
+---
+
+## [LOW-1] `StakingVault::setGuardian` — Guardian can be silently set to the zero address
+
+**File:** `src/core/StakingVault.sol`, `setGuardian()`, line 201
+
+**What an attacker can do:** The owner can accidentally (or intentionally) call `setGuardian(address(0))`. This silently removes the secondary emergency-pause capability. No error is raised, and subsequent `pause()` calls from the ex-guardian address simply revert with `NotGuardian`.
+
+**Conditions required:** Owner calls `setGuardian(address(0))`.
+
+**Fix:** Add `require(newGuardian != address(0), "GUARDIAN_ZERO");` or emit a specific event/revert for a zero-address guardian.
+
+---
+
+## [LOW-2] `RewardDistributor::notifyReward` — MEV sandwich captures disproportionate rewards
+
+**File:** `src/rewards/RewardDistributor.sol`, `notifyReward()`, line 103
+
+**What an attacker can do:** A searcher who sees a pending `notifyReward` transaction can front-run it with a large `deposit()` and back-run with `requestWithdrawal()`, diluting honest stakers' reward share. The attacker captures a portion of the reward proportional to the flash-stake size relative to total supply.
+
+**Conditions required:**
+- The transaction is visible in a public mempool before inclusion.
+- The withdrawal cooldown limits but does not eliminate the attack: capital is locked for the cooldown period, so the attack is only profitable when expected rewards exceed the opportunity cost of the locked capital.
+
+**Mitigations to consider:** Use a time-weighted or snapshot-based reward distribution, commit-reveal for `notifyReward`, or private/protected RPC submission.
+
+---
+
+## Summary Table
+
+| ID | Severity | File | Function | Description |
+|---|---|---|---|---|
+| CRITICAL-1 | Critical | `RewardDistributor.sol` | `claim` | `accrued` never zeroed — unlimited drain |
+| HIGH-1 | High | `RewardDistributor.sol` | `notifyReward` | Dust reward amount permanently locks tokens |
+| HIGH-2 | High | `FixedPointMath.sol` | `mulDiv` | Intermediate overflow causes unrecoverable DoS |
+| MEDIUM-1 | Medium | `StakingVault.sol` | `deposit`, `accrueYield` | Fee-on-transfer tokens silently inflate `totalAssets` |
+| LOW-1 | Low | `StakingVault.sol` | `setGuardian` | Zero address accepted as guardian without error |
+| LOW-2 | Low | `RewardDistributor.sol` | `notifyReward` | MEV sandwich attack on reward notifications |
+
+---
+
+**Priority recommendation:** CRITICAL-1 must be fixed before any deployment — it allows any staker to drain the full reward token balance of the contract with zero economic risk. HIGH-2 should be addressed next as it can cause permanent user-facing DoS as the protocol matures and balances grow.

@@ -1,0 +1,193 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            06
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:25:06Z
+# duration-ms:    407570
+# num-turns:      23
+# context-tokens: 172162
+# output-tokens:  23016
+# cost-usd:       0.548079
+# is-error:       False
+# session-id:     04a9bb28-c618-4c91-9367-90c364bd9119
+# ---- agent output below this line ----
+The test at `RewardDistributor.t.sol:102-117` is particularly revealing — it explicitly asserts that `accrued[alice] == 40 ether` immediately before `claim()`, but never checks that `accrued` is zeroed afterward. The missing line is now confirmed with full confidence.
+
+---
+
+# Security Audit Report — Staking Vault
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/WithdrawalQueue.sol`, `src/core/FeeController.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/`
+
+**Compiler:** Solidity 0.8.24
+
+---
+
+## CRITICAL
+
+### C-1 · `RewardDistributor.sol:119` — `claim()` never resets `accrued`, enabling unlimited double-claiming
+
+**Function:** `RewardDistributor.claim()`
+
+**What an attacker can do:**
+Call `claim()` repeatedly in separate transactions to drain every reward token held by the contract. Each call transfers the same `accrued[msg.sender]` balance again because the field is never zeroed.
+
+**Conditions required:**
+1. At least one `notifyReward` call must have been made since the attacker staked, so that `globalIndex` is non-zero.
+2. A `_checkpoint` must have been triggered for the attacker's account (by any call to `deposit` or `requestWithdrawal`), which moves the computed pending amount into `accrued[msg.sender]`.
+3. The attacker then calls `claim()` multiple times.
+
+**Root cause:**
+```solidity
+// RewardDistributor.sol:119-128
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;  // prevents _pendingFor from returning > 0 again
+    totalClaimed += amount;
+    rewardToken.safeTransfer(msg.sender, amount);  // transferred but not cleared below
+    // BUG: accrued[msg.sender] = 0;  <-- missing
+}
+```
+
+After the first call, `userIndex[msg.sender] == globalIndex`, so `_pendingFor` returns 0. But `accrued[msg.sender]` still holds the old value. Every subsequent call computes `amount = accrued[msg.sender] + 0`, passes the zero-check, and sends another transfer.
+
+**Minimal exploit scenario:**
+1. Alice stakes 100 tokens.
+2. Owner calls `notifyReward(1000)`.
+3. Alice calls `requestWithdrawal(1)` (burns 1 share, tiny cost) → `_checkpoint` fires → `accrued[Alice]` is set to ≈ 1000.
+4. Alice calls `claim()` in a loop until the contract's reward token balance is zero.
+
+---
+
+## MEDIUM
+
+### M-1 · `StakingVault.sol:124` — `deposit()` has no minimum-shares output guard
+
+**Function:** `StakingVault.deposit(uint256 assets)`
+
+**What an attacker can do:**
+A block builder or searcher observing a pending `deposit` transaction can front-run it with a call to `accrueYield`, inflating `totalAssets` and raising the share price. The depositor's transaction then executes at a worse rate, minting fewer shares than intended. The depositor cannot observe or bound the slippage before the transaction settles.
+
+**Conditions required:**
+- The vault must be unpaused (required for both `accrueYield` and `deposit`).
+- The searcher needs enough of the staked asset to call `accrueYield` as owner, or must be the owner themselves.
+- The depositor submits a `deposit` without a slippage bound.
+
+**Note:** `deposit` does revert with `ZeroShares` if rounding drives the result all the way to zero (which requires the price to have been inflated enormously). Moderate inflation merely silently reduces the depositor's position without triggering any error.
+
+---
+
+### M-2 · `StakingVault.sol:183` — `accrueYield` can permanently DoS deposits for non-owner stakers
+
+**Function:** `StakingVault.accrueYield(uint256 assets)`
+
+**What an attacker can do:**
+The owner (or a compromised owner key) can deposit 1 wei as the first staker, then call `accrueYield` with a very large amount. This raises `totalAssets` astronomically relative to `totalSupply` (1 share). Any subsequent depositor whose `assets * 1 / totalAssets` rounds to zero will hit `ZeroShares` and be unable to enter the vault at any reasonable deposit size.
+
+**Conditions required:**
+- Owner is malicious or compromised.
+- Only 1 share is outstanding (owner is the sole staker or has not yet distributed shares widely).
+- No cooldown prevents this; `accrueYield` has no cap.
+
+**Note:** This is a trust-model concern rather than a permissionless exploit, but it represents a single point of failure with no on-chain check to bound the share-price ratio.
+
+---
+
+## LOW
+
+### L-1 · `RewardDistributor.sol:103` — Sub-precision rewards are permanently locked
+
+**Function:** `RewardDistributor.notifyReward(uint256 amount)`
+
+**What happens:**
+```solidity
+globalIndex += amount.mulDiv(FixedPointMath.WAD, supply);
+```
+`mulDiv` is plain integer division: `(amount * 1e18) / supply`. If `amount * 1e18 < supply` (e.g., `amount = 1 wei` with `supply = 2e18` shares), the division truncates to zero. `globalIndex` does not change, the tokens are transferred in, `totalNotified` is incremented, but no account can ever claim those tokens. There is no recovery path.
+
+**Conditions required:**
+- Owner calls `notifyReward` with an amount smaller than `supply / 1e18`.
+- Worst case: many small calls accumulate meaningful locked balances.
+
+---
+
+### L-2 · `StakingVault.sol:89` / `StakingVault.sol:201` — Guardian role accepts zero address with no validation
+
+**Functions:** `StakingVault` constructor, `StakingVault.setGuardian(address)`
+
+**What happens:**
+`initialGuardian` in the constructor and the `newGuardian` argument in `setGuardian` are accepted without a zero-address check. Setting the guardian to `address(0)` silently disables the guardian role; the `pause()` check (`msg.sender != owner && msg.sender != guardian`) then never matches zero address, so only the owner can pause. There is no event or revert distinguishing an intentional removal from an accidental erasure.
+
+**Conditions required:**
+- Deployer passes `address(0)` for `initialGuardian`, or owner later calls `setGuardian(address(0))`.
+
+---
+
+### L-3 · `RewardDistributor.sol:134` — `mulDiv` in `_pendingFor` can revert on large `globalIndex` values
+
+**Function:** `RewardDistributor._pendingFor(address account)`
+
+**What happens:**
+```solidity
+return vault.balanceOf(account).mulDiv(delta, FixedPointMath.WAD);
+// expands to: (balance * delta) / 1e18
+```
+`FixedPointMath.mulDiv` uses a simple `(x * y) / d` without a 512-bit intermediate. If `balance * delta` overflows `uint256` (approximately `1.16 × 10^77`), the Solidity 0.8.x arithmetic check causes an unconditional revert. Once `globalIndex` grows large enough — possible when many `notifyReward` calls are made against a tiny share supply — legitimate users will be unable to call `claim()`, `claimable()`, or trigger a `_checkpoint`, permanently locking their accrued rewards.
+
+**Conditions required:**
+- Owner repeatedly calls `notifyReward` with large amounts relative to a small share supply, pushing `globalIndex` near `2^256 / balance`.
+- Affected users cannot claim or checkpoint until the issue is resolved (no on-chain recovery path).
+
+---
+
+## INFORMATIONAL
+
+### I-1 · `StakingVault.sol:77` / `RewardDistributor.sol:58` — Reentrancy guard initialises to 0, incurring cold-SSTORE cost on every entry
+
+**What happens:**
+Both contracts implement the reentrancy guard as `uint256 private _entered` starting at 0, writing 1 on entry and 0 on exit. The Ethereum EVM charges 20,000 gas for a write from zero to non-zero and only 2,900 gas for non-zero to non-zero. The OpenZeppelin convention (constant `NOT_ENTERED = 1`, `ENTERED = 2`) avoids the expensive zero-to-nonzero write after the first call. With the current implementation, every protected function call pays the higher SSTORE cost on entry and restores to zero (cold-slot cost again on the next entry). This is a gas inefficiency, not a security defect.
+
+---
+
+### I-2 · `Ownable2Step.sol:30` — `transferOwnership(address(0))` is a silent cancel with no dedicated function
+
+**What happens:**
+Passing `address(0)` to `transferOwnership` sets `pendingOwner = address(0)`. Because zero address can never call `acceptOwnership`, this effectively cancels a pending transfer. The docs describe this as intentional, but the function emits an `OwnershipTransferStarted(owner, address(0))` event that could mislead off-chain monitors into thinking a transfer to the zero address is in progress.
+
+---
+
+## Summary Table
+
+| ID | Severity | File | Function | Impact |
+|----|----------|------|----------|--------|
+| C-1 | Critical | `RewardDistributor.sol` | `claim()` | Complete drain of all reward tokens |
+| M-1 | Medium | `StakingVault.sol` | `deposit()` | Depositor receives fewer shares than intended; no slippage bound |
+| M-2 | Medium | `StakingVault.sol` | `accrueYield()` | Owner can DoS all future deposits |
+| L-1 | Low | `RewardDistributor.sol` | `notifyReward()` | Small reward amounts locked permanently |
+| L-2 | Low | `StakingVault.sol` | constructor / `setGuardian()` | Guardian silently disabled if set to zero address |
+| L-3 | Low | `RewardDistributor.sol` | `_pendingFor()` | Overflow on large `globalIndex` locks user rewards |
+| I-1 | Info | Both core contracts | reentrancy guards | Excess gas cost per protected call |
+| I-2 | Info | `Ownable2Step.sol` | `transferOwnership()` | Misleading event when cancelling a pending transfer |
+
+---
+
+## Recommended Fix for C-1
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
++   accrued[msg.sender] = 0;          // ← clear before transfer
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    emit Claimed(msg.sender, amount);
+}
+```

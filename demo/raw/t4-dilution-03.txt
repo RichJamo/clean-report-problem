@@ -1,0 +1,189 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            03
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:09:01Z
+# duration-ms:    338392
+# num-turns:      16
+# context-tokens: 120587
+# output-tokens:  20155
+# cost-usd:       0.4153965
+# is-error:       False
+# session-id:     63e31131-2d11-4a3d-b1e2-022add4ac247
+# ---- agent output below this line ----
+Now I have a thorough picture of every contract. Let me compile the findings.
+
+---
+
+# Smart Contract Security Audit Report
+
+**Project:** StakingVault / RewardDistributor  
+**Scope:** `src/core/`, `src/auth/`, `src/rewards/`, `src/libraries/`  
+**Date:** 2026-08-12
+
+---
+
+## CRITICAL — C-01: `RewardDistributor.claim()` Never Zeroes `accrued[msg.sender]`
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:**  
+Drain every reward token held by the `RewardDistributor` contract, far beyond their legitimate entitlement.
+
+**Conditions required:**  
+The attack becomes available after the victim account's pending rewards have been moved into the `accrued` mapping by a call to `checkpoint` — which happens automatically inside every `deposit` and `requestWithdrawal` call. Once any non-zero amount lands in `accrued[attacker]`, the attacker can call `claim()` in a loop until the contract balance is exhausted.
+
+**Root cause:**  
+`claim()` reads `accrued[msg.sender]` and includes it in the payout, but never writes `accrued[msg.sender] = 0`. It only resets `userIndex`, which zeroes out *future* pending rewards computed by `_pendingFor`. The stale `accrued` value is there on every subsequent call.
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // ← resets _pendingFor to 0
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ← accrued[msg.sender] is NEVER cleared
+}
+```
+
+**Exploit trace:**
+
+1. Attacker stakes 100 shares. `accrued[attacker] = 0`, `userIndex[attacker] = 0`.  
+2. Owner calls `notifyReward(100e18)`. `globalIndex = 1e18`.  
+3. Attacker deposits 1 wei more (any balance-mutating action triggers `_checkpoint`):  
+   - `_pendingFor` = 100 × (1e18 − 0) / 1e18 = **100e18**  
+   - `accrued[attacker] = 100e18`  
+   - `userIndex[attacker] = globalIndex`  
+4. Attacker calls `claim()`:  
+   - `amount = 100e18 + 0 = 100e18` → transfers 100e18 reward tokens  
+   - `accrued[attacker]` **remains 100e18**  
+5. Attacker calls `claim()` again → `amount = 100e18 + 0 = 100e18` → transfers another 100e18  
+6. Repeat until the contract is empty.
+
+**Amplifying factor:** `setRewardDistributor` is a one-shot setter (`DistributorAlreadySet` guard), so the buggy distributor cannot be swapped out without redeploying the entire system.
+
+**Fix:** Add `accrued[msg.sender] = 0;` before (or immediately after) the transfer in `claim()`.
+
+---
+
+## HIGH — H-01: `completeWithdrawal` Reads `feeRecipient` Live, Allowing Owner to Brick Pending Withdrawals
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+**What an attacker can do:**  
+A malicious or compromised owner can prevent any staker whose queued request carries a non-zero `feeBps` from ever completing their withdrawal, effectively freezing their principal indefinitely.
+
+**Conditions required:**  
+1. At least one `requestWithdrawal` was processed when `withdrawalFeeBps > 0`, so `feeBps > 0` is stored in that queue entry.  
+2. The owner calls `FeeController.setFeeRecipient()` and points it at a contract that reverts on ERC-20 receipt.
+
+**Root cause:**  
+The fee rate (`feeBps`) is correctly frozen at request time and stored in the queue. However, the *recipient address* is not. It is re-read from `feeController.feeRecipient()` at settlement time. If that address is a reverting contract, the `safeTransfer` to it fails, which reverts the entire `completeWithdrawal` call. The owner can then demand conditions in exchange for restoring a valid recipient.
+
+```solidity
+// StakingVault.sol line 172-174
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);  // live read
+}
+```
+
+The owner *can* unblock this by pointing `feeRecipient` back to a valid address, which distinguishes this from a permanent freeze — but users are entirely at the owner's mercy while it is set incorrectly.
+
+**Fix:** Either (a) store the `feeRecipient` in the queue entry at request time (consistent with how `feeBps` is already snapshotted), or (b) add a pull-payment pattern where the fee accumulates in a claimable balance rather than being pushed per-withdrawal.
+
+---
+
+## MEDIUM — M-01: `FixedPointMath.mulDiv` Uses Naive 256-bit Multiplication (No Full Precision)
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:**  
+Cause `_pendingFor`, `notifyReward`, or `convertToShares`/`convertToAssets` to revert permanently for affected accounts, making rewards unclaimable (DoS).
+
+**Conditions required:**  
+The intermediate product `x * y` must exceed `type(uint256).max ≈ 1.16 × 10⁷⁷`. Practically, this requires either (a) an unusually large `globalIndex` (accumulated via many `notifyReward` calls or one astronomically large call) combined with a large staker balance, or (b) a large `totalAssets` combined with a large share count. With Solidity 0.8.x the result is a revert (not a wrap), so no incorrect value is produced — but the function call becomes permanently blocked.
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // panics if x * y overflows uint256
+}
+```
+
+A library such as OpenZeppelin's `Math.mulDiv` uses 512-bit intermediate arithmetic (via the `mulmod` opcode) and handles this without overflow.
+
+**Fix:** Replace the body with a full-precision implementation, e.g. OpenZeppelin `Math.mulDiv`.
+
+---
+
+## LOW — L-01: `accrueYield` Updates `totalAssets` Before Confirming Token Transfer (CEI Violation)
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `accrueYield()` (line 183)
+
+**What an attacker can do:**  
+Not exploitable with a standard ERC-20 under current guards, but the effect-before-interaction ordering leaves the contract in a transiently inconsistent state: `totalAssets` reflects the new value before the tokens have arrived. If a future asset type introduces send-hooks (e.g. ERC-777), an external observer or a hook reading `totalAssets` mid-transfer would see an inflated value. The `nonReentrant` guard prevents re-entrant state mutations, but does not prevent view reads on the inflated `totalAssets`.
+
+**Conditions required:**  
+An asset token that issues a callback on `transferFrom` to the vault or to any contract that reads `totalAssets` (e.g. an on-chain oracle built on top of this vault).
+
+```solidity
+totalAssets += assets;                                    // effect
+asset.safeTransferFrom(msg.sender, address(this), assets); // interaction
+```
+
+**Fix:** Move `totalAssets += assets` to after `safeTransferFrom`.
+
+---
+
+## LOW — L-02: `Ownable2Step.transferOwnership` Accepts `address(0)` for `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do:**  
+A careless owner can call `transferOwnership(address(0))`, setting `pendingOwner = address(0)`. No transaction can be sent from the zero address, so `acceptOwnership` can never be called and the staged transfer is permanently blocked. The current owner retains control and can issue a corrective `transferOwnership` call, so the impact is limited to a poor UX / operational error risk rather than a fund loss.
+
+**Conditions required:**  
+Owner mistypes or programmatically passes `address(0)` to `transferOwnership`.
+
+**Fix:** Add `require(newOwner != address(0), "ZERO_OWNER");` at the top of `transferOwnership`.
+
+---
+
+## INFORMATIONAL — I-01: `totalClaimed` Accounting Is Corrupted by the `claim` Bug
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+`totalClaimed` is incremented by the full `amount` on every call to `claim()`, including repeat claims of the same stale `accrued` value. After the C-01 exploit, `totalClaimed` will exceed `totalNotified`, silently breaking the implicit invariant `totalClaimed ≤ totalNotified` and making any off-chain accounting that relies on these counters unreliable.
+
+---
+
+## INFORMATIONAL — I-02: Cooldown Period Is Immutable
+
+**File:** `src/core/WithdrawalQueue.sol` (line 29)
+
+`cooldown` is `immutable` and can never be adjusted post-deployment. Should market conditions or governance decisions require a shorter or longer lock period, a full vault migration would be necessary. This is not a direct security vulnerability but is a notable operational inflexibility.
+
+---
+
+## Summary Table
+
+| ID   | Severity    | Contract / Function                              | Impact                                               |
+|------|-------------|--------------------------------------------------|------------------------------------------------------|
+| C-01 | Critical    | `RewardDistributor.claim()`                      | Unlimited drain of reward token balance              |
+| H-01 | High        | `StakingVault.completeWithdrawal()`              | Owner can freeze pending withdrawals indefinitely    |
+| M-01 | Medium      | `FixedPointMath.mulDiv()`                        | DoS via overflow on extreme inputs                   |
+| L-01 | Low         | `StakingVault.accrueYield()`                     | Transient totalAssets inflation before token arrives |
+| L-02 | Low         | `Ownable2Step.transferOwnership()`               | Zero address accepted, transfer silently no-ops      |
+| I-01 | Info        | `RewardDistributor.claim()` — `totalClaimed`     | Off-chain accounting invariant broken by C-01        |
+| I-02 | Info        | `WithdrawalQueue` — `cooldown`                   | Cooldown not adjustable after deployment             |

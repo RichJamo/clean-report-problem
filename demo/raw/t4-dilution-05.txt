@@ -1,0 +1,230 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t4-dilution
+# run:            05
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:19:54Z
+# duration-ms:    310416
+# num-turns:      18
+# context-tokens: 140972
+# output-tokens:  18167
+# cost-usd:       0.3945168
+# is-error:       False
+# session-id:     e8b12c69-d207-4a20-b9f1-b69b710da4fb
+# ---- agent output below this line ----
+Now I have a thorough understanding of all the contracts. Let me compile the full audit report.
+
+---
+
+# Smart Contract Security Audit Report
+
+**Project:** Single-asset staking vault with reward distribution
+**Scope:** `src/core/StakingVault.sol`, `src/rewards/RewardDistributor.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/`
+**Compiler:** Solidity 0.8.24
+
+---
+
+## Summary
+
+| ID | Severity | Title | File |
+|----|----------|-------|------|
+| H-1 | **Critical** | `accrued` balance never cleared in `claim()` — infinite drain | `RewardDistributor.sol` |
+| H-2 | **High** | Buggy/malicious `rewardDistributor` can permanently DoS `requestWithdrawal`, trapping user funds | `StakingVault.sol` |
+| M-1 | **Medium** | CEI violation in `deposit()` and `accrueYield()` — state mutated before external call | `StakingVault.sol` |
+| L-1 | **Low** | Unsafe silent truncation in `uint64` timestamp cast can bypass cooldown with extreme cooldown values | `WithdrawalQueue.sol` |
+| I-1 | **Informational** | `mulDiv` intermediate product can overflow and revert for extreme values | `FixedPointMath.sol` |
+
+---
+
+## H-1 — Critical: `accrued` Balance Never Cleared in `claim()`
+
+**File:** `src/rewards/RewardDistributor.sol`
+**Function:** `claim()` (line 119)
+
+### What an attacker can do
+
+Drain the entire reward token balance of `RewardDistributor` by calling `claim()` in a loop after any checkpoint has written a non-zero value into `accrued[msg.sender]`.
+
+### Conditions required
+
+1. The victim's vault share balance must have changed at least once after rewards were notified, triggering `vault._checkpoint` → `distributor.checkpoint`. This folds the pending entitlement into `accrued[account]` and sets `userIndex[account] = globalIndex`.
+2. The distributor must hold enough reward tokens to drain.
+
+### Root cause
+
+`claim()` updates `userIndex[msg.sender]` (preventing re-accumulation of index-delta rewards) but **never sets `accrued[msg.sender] = 0`**:
+
+```solidity
+// src/rewards/RewardDistributor.sol:119
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // ← clears index-based pending only
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ← accrued[msg.sender] is never zeroed
+}
+```
+
+After `claim()` returns, `accrued[msg.sender]` retains its pre-call value. On the next call, `_pendingFor` returns 0 (because `userIndex == globalIndex`), but `accrued[msg.sender]` is still non-zero, so the full amount is transferred again. This repeats until the contract is empty.
+
+### Attack walkthrough
+
+```
+1. Alice stakes 100 shares in the vault.
+2. Owner calls notifyReward(100 ether) → globalIndex increases.
+3. Alice calls vault.deposit(1) → vault._checkpoint(alice) fires:
+       _pendingFor(alice) = 100 ether
+       accrued[alice] += 100 ether   →  accrued[alice] = 100 ether
+       userIndex[alice] = globalIndex
+4. Alice calls distributor.claim():
+       amount = 100 ether + _pendingFor(alice) = 100 + 0 = 100 ether
+       userIndex[alice] = globalIndex  (no-op)
+       accrued[alice] unchanged  →  still 100 ether
+       Transfers 100 ether reward tokens to Alice.  ✓
+5. Alice calls distributor.claim() again:
+       amount = accrued[alice] + 0  =  100 ether   (duplicate!)
+       Transfers another 100 ether.  ✗
+6. Repeat step 5 until distributor balance = 0.
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+## H-2 — High: Buggy Distributor Can Permanently DoS `requestWithdrawal`, Trapping User Funds
+
+**File:** `src/core/StakingVault.sol`
+**Function:** `_checkpoint()` (line 222), called from `deposit()` (line 127) and `requestWithdrawal()` (line 149)
+
+### What an attacker can do
+
+If `rewardDistributor` is set to an address whose `checkpoint()` implementation reverts (due to a bug, a compromised contract, or malicious intent), every call to `requestWithdrawal()` permanently reverts, trapping all staked funds in the vault indefinitely.
+
+### Conditions required
+
+- `rewardDistributor` has been set (it is set exactly once via `setRewardDistributor`, which is owner-only and irreversible per ADR-0006).
+- The distributor contract's `checkpoint()` function reverts for any input.
+
+### Root cause
+
+`_checkpoint` makes an external call to `distributor.checkpoint(account)` with no revert-isolation:
+
+```solidity
+// src/core/StakingVault.sol:222
+function _checkpoint(address account) private {
+    IRewardDistributor distributor = rewardDistributor;
+    if (address(distributor) != address(0)) {
+        distributor.checkpoint(account);   // ← uncaught revert propagates up
+    }
+}
+```
+
+`requestWithdrawal` is intentionally callable while paused (per ADR-0004) so that a pause cannot trap funds. However, it unconditionally calls `_checkpoint`, so a reverting distributor achieves the same freeze:
+
+```solidity
+// src/core/StakingVault.sol:143
+function requestWithdrawal(uint256 shares) external nonReentrant returns (uint256 id) {
+    ...
+    _checkpoint(msg.sender);   // ← DoS vector; cannot be bypassed
+    ...
+}
+```
+
+Since `setRewardDistributor` can only be called once, there is **no recovery path** once an unsafe distributor has been wired in. Users cannot exit the vault; only requests already in the `WithdrawalQueue` (which does not call `_checkpoint`) can be completed.
+
+**Fix:** Either (a) wrap the `distributor.checkpoint` call in a try/catch so that a reverting distributor degrades gracefully, or (b) allow the owner to update `rewardDistributor` when the vault has no pending accounting state. At minimum, document the risk prominently.
+
+---
+
+## M-1 — Medium: CEI Violation in `deposit()` and `accrueYield()`
+
+**File:** `src/core/StakingVault.sol`
+**Functions:** `deposit()` (line 124), `accrueYield()` (line 183)
+
+### What an attacker can do
+
+With a callback-enabled asset token (ERC-777 or any token that calls a hook on `transferFrom`), an external observer's hook fires **after** the vault's storage state has been updated but **before** tokens have been received. During the hook, the vault's `totalAssets`, `totalSupply`, and `balanceOf` already reflect values that are not yet backed by real tokens. No re-entry into vault functions is possible (the `nonReentrant` guard blocks it), but the inconsistent state is observable from any contract that reads vault state during the hook.
+
+### Conditions required
+
+- The staked asset is a callback-enabled token (ERC-777 or similar).
+- A third-party contract reads vault state during the token sender hook.
+
+### Root cause
+
+```solidity
+// src/core/StakingVault.sol:132
+totalAssets += assets;         // ← state mutated first
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+
+asset.safeTransferFrom(msg.sender, address(this), assets);  // ← external call last
+```
+
+Standard Checks-Effects-Interactions requires the external call to come last but also requires that no external state reads (by third parties) can observe an inconsistent intermediate state. The `nonReentrant` guard prevents re-entry but does not prevent external read-only observation. The same pattern appears in `accrueYield()` (line 187).
+
+**Fix:** Reorder to perform `safeTransferFrom` before updating state, matching the strict CEI pattern. If re-entrancy is the only concern and the guard is deemed sufficient, document the assumption that the asset is a standard ERC-20.
+
+---
+
+## L-1 — Low: Unsafe `uint64` Timestamp Cast Can Produce a Cooldown of Zero or Wrap Around
+
+**File:** `src/core/WithdrawalQueue.sol`
+**Function:** `enqueue()` (line 75)
+
+### What an attacker can do
+
+With a sufficiently large `cooldown` value, the addition `uint64(block.timestamp) + cooldown` overflows `uint64`, wrapping `unlockAt` to a value in the past and allowing immediate settlement of any withdrawal request — effectively bypassing the cooldown entirely.
+
+### Conditions required
+
+- `cooldown` is set at construction to a value close to `type(uint64).max - block.timestamp` (approximately `1.8 × 10¹⁹ − 1.7 × 10⁹ ≈ 1.8 × 10¹⁹` seconds).
+- In practice this requires a misconfigured deployment, but there is no guard preventing it.
+
+### Root cause
+
+```solidity
+// src/core/WithdrawalQueue.sol:75
+uint64 unlockAt = uint64(block.timestamp) + cooldown;
+```
+
+`block.timestamp` is `uint256` and is silently truncated to `uint64` (explicit narrowing casts do not revert in Solidity 0.8). The subsequent addition is in `uint64` arithmetic and wraps around on overflow.
+
+**Fix:** Use a safe cast (`SafeCast.toUint64`) on `block.timestamp` and validate at construction that `cooldown` does not exceed a sane maximum (e.g., 365 days).
+
+---
+
+## I-1 — Informational: `mulDiv` Can Revert on Overflow for Large Inputs
+
+**File:** `src/libraries/FixedPointMath.sol`
+**Function:** `mulDiv()` (line 14)
+
+### What an attacker can do
+
+Cause `notifyReward`, `convertToShares`, `convertToAssets`, or `_pendingFor` to revert unexpectedly by arranging inputs such that the intermediate product `x * y` exceeds `type(uint256).max`. This would create a DoS condition for those operations.
+
+### Conditions required
+
+- Inputs approaching `√(2²⁵⁶) ≈ 1.16 × 10³⁸`. With 18-decimal tokens, this requires a token supply on the order of `10²⁰` tokens (far beyond realistic supplies but within the range of poorly configured test or novelty tokens).
+
+### Root cause
+
+```solidity
+// src/libraries/FixedPointMath.sol:14
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // ← no 512-bit intermediate; overflows revert
+}
+```
+
+The comment correctly notes that Solidity 0.8 reverts on overflow rather than wrapping, so the result is never silently incorrect — the risk is only unexpected reversion, not wrong arithmetic.
+
+**Fix:** For a production deployment, replace with a 512-bit intermediate `mulDiv` (e.g., the algorithm from Remco Bloemen / OpenZeppelin `Math.mulDiv`) to handle the full `uint256 × uint256` product range without overflow.
+
+---
+
+*End of report.*

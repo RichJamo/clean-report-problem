@@ -1,0 +1,223 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3-agentconfig
+# run:            02
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T14:56:25Z
+# duration-ms:    389508
+# num-turns:      14
+# context-tokens: 78678
+# output-tokens:  22637
+# cost-usd:       0.49531814999999996
+# is-error:       False
+# session-id:     7fccb013-6cc3-412b-a255-88f48456e6f2
+# ---- agent output below this line ----
+I have all the information I need. Here is the full audit report.
+
+---
+
+# Security Audit Report — StakingVault Project
+
+**Date:** 2026-08-12  
+**Scope:** All contracts under `src/`  
+**Compiler:** Solidity 0.8.24  
+
+---
+
+## Summary
+
+| Severity | Count |
+|---|---|
+| Critical | 1 |
+| High | 1 |
+| Medium | 2 |
+| Low | 2 |
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()` never zeros `accrued[msg.sender]`, allowing unlimited reward drain
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:**  
+Call `claim()` repeatedly to withdraw the same reward balance over and over, draining every reward token held by the distributor until the contract is empty.
+
+**Conditions required:**  
+1. The attacker must have staked tokens and had rewards accumulate (i.e., `globalIndex > userIndex[attacker]` at some point while holding shares).  
+2. A vault balance-changing operation (`deposit` or `requestWithdrawal`) must have been called, triggering `_checkpoint`, which wrote a non-zero value into `accrued[attacker]`.  
+3. No other preconditions — this is exploitable by any ordinary staker.
+
+**Root cause:**
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // prevents future _pendingFor double-count
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ← accrued[msg.sender] is NEVER reset to 0
+}
+```
+
+After the first call:
+- `userIndex[msg.sender] == globalIndex`, so `_pendingFor` returns `0` on every subsequent call.
+- `accrued[msg.sender]` still holds the full checkpointed reward amount.
+- Every subsequent `claim()` pays out `accrued[msg.sender]` again, unboundedly.
+
+**Proof of exploit sequence:**  
+```
+alice stakes 100 tokens
+owner calls notifyReward(40 tokens)  → globalIndex = 0.4e18
+alice calls deposit(100 tokens)      → _checkpoint sets accrued[alice] = 40
+alice calls claim()                  → receives 40 tokens (accrued[alice] still = 40)
+alice calls claim()                  → receives 40 more tokens (accrued unchanged)
+... repeat until distributor is drained
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+## High
+
+### H-1 — `deposit()` updates `totalAssets` before token transfer; incompatible with fee-on-transfer tokens
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (line 124)
+
+**What an attacker can do:**  
+This is not a direct attack vector, but a design flaw: when a fee-on-transfer ERC-20 is used as the vault asset, the vault permanently records more assets than it actually holds. This overstates the share price, making the vault insolvent. Users who withdraw early receive their full entitlement; users who withdraw later find the contract unable to pay.
+
+**Conditions required:**  
+- The vault is deployed with a fee-on-transfer token (or a token that later activates transfer fees, e.g., upgradeable tokens).  
+- Multiple deposits must occur for the discrepancy to accumulate to the point of insolvency.
+
+**Root cause:**
+
+```solidity
+totalAssets += assets;             // credits full `assets`
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+
+asset.safeTransferFrom(msg.sender, address(this), assets);
+// only (assets - fee) arrives; totalAssets is overstated by the fee amount
+```
+
+Because `totalAssets` is tracked in storage (intentionally, to prevent donation manipulation), there is no mechanism to reconcile the recorded value with the actual balance. Each deposit with a fee-on-transfer token grows the discrepancy by the fee amount. The vault will eventually be unable to honor all withdrawal obligations.
+
+**Fix:** Either explicitly document that fee-on-transfer tokens are unsupported and add a deploy-time check (compare pre/post balance on a test transfer), or reconcile `totalAssets` with the actual received amount by measuring the balance delta.
+
+---
+
+## Medium
+
+### M-1 — `completeWithdrawal()` resolves `feeRecipient` at completion time, not at request time
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+**What an attacker can do:**  
+Anyone who controls the `FeeController` owner key can change `feeRecipient` and redirect the fee portion of all currently pending (in-cooldown) withdrawal requests to an address of their choosing. The fee rate is correctly locked at request time, but the destination is not.
+
+**Conditions required:**  
+- One or more withdrawal requests are in the cooldown period.  
+- The `FeeController` owner key is compromised or acts maliciously.
+
+**Root cause:**
+
+```solidity
+// feeBps is correctly snapshotted in WithdrawalQueue at request time.
+(uint256 assets, uint256 feeBps) = withdrawalQueue.settle(id, msg.sender);
+
+uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
+paid = assets - fee;
+
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);  // resolved live
+}
+```
+
+The README documents that the fee rate is locked at request time, suggesting the intent is to fully protect users from retroactive changes. Locking the recipient in the queue record would be consistent with that intent and would close this window.
+
+**Fix:** Store the `feeRecipient` address alongside `feeBps` in `WithdrawalQueue.Request` at request creation time and use the stored address in `completeWithdrawal`.
+
+---
+
+### M-2 — `FixedPointMath.mulDiv()` uses a 256-bit intermediate, enabling overflow-based DoS
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:**  
+When `x * y` exceeds `type(uint256).max`, the operation reverts under Solidity 0.8.x's checked arithmetic. This can permanently block deposits and reward notifications if either operand is large enough.
+
+**Conditions required:**  
+- For `convertToShares` in `deposit`: `assets * totalSupply > 2^256 − 1`.  
+- For `notifyReward`: `amount * 1e18 > 2^256 − 1`, which requires an amount exceeding ~1.16 × 10^59 tokens — practically unreachable for tokens with an 18-decimal supply.  
+- The `totalSupply` overflow scenario is more plausible: if totalSupply has been driven to a large value through many small deposits, a deposit with a large `assets` value will overflow. An adversary with unlimited capital could intentionally drive totalSupply high to block subsequent large depositors.
+
+**Root cause:**
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // intermediate product not widened to 512 bits
+}
+```
+
+**Fix:** Replace with a full-precision 512-bit multiply-then-divide (as implemented in, e.g., Solmate's `FixedPointMathLib.mulDivDown` or OpenZeppelin's `Math.mulDiv`).
+
+---
+
+## Low
+
+### L-1 — `nonReentrant` uses `0` as the "not entered" sentinel, wasting gas on every call
+
+**File:** `src/core/StakingVault.sol` (line 77) and `src/rewards/RewardDistributor.sol` (line 58)
+
+**What an attacker can do:** Nothing — this is a gas-efficiency issue only.
+
+**Conditions required:** N/A.
+
+The `_entered` slot initialises to `0` (cold storage). Setting it from `0 → 1` on entry costs an extra ~15,000 gas (cold SSTORE) compared to the `1 → 2` pattern, which keeps the slot warm. With the current `0/1` scheme, every protected call pays the cold-write cost.
+
+**Fix:** Initialise `_entered = 1` in both constructors and check/reset with `2`/`1` instead of `1`/`0`.
+
+---
+
+### L-2 — `Ownable2Step.transferOwnership()` accepts `address(0)` as `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do:** Nothing directly — the current owner is unaffected and retains all privileges. However, calling `transferOwnership(address(0))` silently locks the pending-owner slot until the owner calls `transferOwnership` again, with no revert to signal the mistake.
+
+**Conditions required:** Owner inadvertently passes `address(0)`.
+
+**Fix:** Add `require(newOwner != address(0), "ZERO_OWNER");` in `transferOwnership`.
+
+---
+
+## Informational
+
+- **`StakingVault.setGuardian()` allows `address(0)`** — no zero-address guard, but setting the guardian to zero simply disables the role, which is recoverable.  
+- **`unpause()` emits `PausedSet(false)` even when already unpaused** — misleading event with no security impact.  
+- **`totalClaimed` in `RewardDistributor` will undercount** once the critical claim bug (C-1) is exploited, since `totalClaimed` increments correctly but rewards are paid multiple times.
+
+---
+
+## Severity Definitions
+
+| Severity | Description |
+|---|---|
+| **Critical** | Direct loss of funds with no preconditions beyond normal user access |
+| **High** | Loss of funds or severe protocol dysfunction under realistic deployment conditions |
+| **Medium** | Loss/misdirection of funds requiring a privileged actor or non-standard token |
+| **Low** | No fund loss; degrades gas efficiency or operator experience |

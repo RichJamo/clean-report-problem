@@ -1,0 +1,206 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            10
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-13T07:35:39Z
+# duration-ms:    407416
+# num-turns:      16
+# context-tokens: 105486
+# output-tokens:  23903
+# cost-usd:       0.52983975
+# is-error:       False
+# session-id:     26b93095-a11b-409f-ac1a-bd21f05988b3
+# ---- agent output below this line ----
+I now have everything I need. Here is the complete audit report.
+
+---
+
+# Security Audit Report — StakingVault System
+
+**Date:** 2026-08-13  
+**Scope:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `SafeTransferLib`, `FixedPointMath`  
+**Status:** Pre-audit. Not deployed.
+
+---
+
+## Critical
+
+### C-01 — `RewardDistributor.claim()` never zeros `accrued[msg.sender]`, enabling unlimited drain
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()` (line 119)
+
+**What an attacker can do:** Repeatedly call `claim()` in separate transactions to collect the same reward amount over and over, draining the entire reward-token balance of the contract.
+
+**The bug:**
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // resets pending to 0
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);
+    // ❌ accrued[msg.sender] is never set to 0
+    emit Claimed(msg.sender, amount);
+}
+```
+
+After the call, `userIndex[msg.sender] == globalIndex`, so `_pendingFor` returns 0 on the next call. But `accrued[msg.sender]` retains whatever value the vault's `checkpoint` wrote into it, so `amount = accrued[msg.sender] + 0` evaluates to the same non-zero figure on every subsequent call.
+
+**Conditions required:**
+
+1. Rewards have been notified at least once (`notifyReward` called with `globalIndex` > 0).
+2. The vault called `checkpoint(account)` for the attacker's address at least once while rewards were pending — this happens automatically on every `deposit` or `requestWithdrawal` that follows a `notifyReward`.
+3. The attacker calls `claim()` more than once.
+
+**Proof-of-concept sequence:**
+
+```
+Alice stakes 100 ETH.
+notifyReward(40 ETH)         → globalIndex = 0.4e18
+Alice calls deposit(1 wei)   → _checkpoint(alice) runs:
+                                  accrued[alice] = 40e18
+                                  userIndex[alice] = 0.4e18
+Alice calls claim()          → receives 40e18, accrued[alice] unchanged (40e18)
+Alice calls claim()          → receives 40e18 again
+Alice calls claim()          → receives 40e18 again … until the contract is empty
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before (or immediately after) the transfer in `claim()`.
+
+---
+
+## High
+
+### H-01 — Cross-contract reentrancy during `claim()` enables single-transaction exploitation of C-01 when the reward token has transfer hooks
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()` (line 126); `src/core/StakingVault.sol`, `deposit()` / `requestWithdrawal()`
+
+**What an attacker can do:** With an ERC-777-compatible reward token (or any token that invokes a recipient hook on transfer), atomically exploit C-01 within a single transaction, making the double-claim harder to detect and frontrun-proof.
+
+**How it works:**
+
+During `rewardToken.safeTransfer(msg.sender, amount)` in `claim()`, the distributor's reentrancy lock (`_entered == 1`) prevents re-entering `claim()` directly. However, the **vault's** reentrancy lock (`_entered == 0`) is unset at this moment. From inside the hook the attacker calls `vault.deposit()` or `vault.requestWithdrawal()`:
+
+1. Vault's `nonReentrant` passes (vault `_entered` is 0).
+2. Vault calls `distributor.checkpoint(attacker)` (no reentrancy guard on `checkpoint`).
+3. `checkpoint` sees `delta = globalIndex - userIndex[attacker] = 0` (already synced), so `accrued[attacker]` stays at its old unclaimed value.
+4. Control returns to `claim()`, which completes.
+5. In a subsequent transaction, `accrued[attacker]` is still non-zero → double-claim (C-01).
+
+**Conditions required:**
+
+1. C-01 is present (it is).
+2. `rewardToken` implements a send hook (ERC-777 `tokensReceived` / callback-on-transfer pattern).
+
+**Fix:** Fix C-01 (zeroing `accrued`). Additionally, consider resetting `accrued` and syncing `userIndex` at the very start of `claim()` before any external call, following strict CEI.
+
+---
+
+## Medium
+
+### M-01 — `completeWithdrawal()` reads `feeRecipient` at settlement time; a blocked recipient permanently prevents fee-bearing withdrawals from completing
+
+**File:** `src/core/StakingVault.sol`, `completeWithdrawal()` (line 166)
+
+**What an attacker / malicious owner can do:** If the `feeRecipient` is changed to an address that causes `asset.safeTransfer` to revert (e.g., a USDC-blacklisted address, or a contract whose ERC-777 `tokensReceived` hook reverts), every pending request that carries a non-zero fee will revert until the recipient is corrected.
+
+```solidity
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);  // live read
+}
+asset.safeTransfer(msg.sender, paid);
+```
+
+Because `WithdrawalQueue.settle()` sets `request.settled = true` before the transfer, and the transfer reverts, the entire transaction rolls back — the request remains unsettled but is temporarily unclaimable. Funds are not permanently lost if the owner corrects `feeRecipient`, but in a worst-case scenario (key compromise, governance attack) users could be locked out indefinitely.
+
+**Conditions required:**
+
+1. Asset token has address-level transfer restrictions (USDC-style blacklist, ERC-777 hooks, etc.).
+2. `FeeController.setFeeRecipient` is called with a restricted address after one or more non-zero-fee withdrawal requests are open.
+
+**Fix:** Snapshot `feeRecipient` into the `WithdrawalQueue.Request` struct alongside `feeBps`, just as the fee rate is already snapshotted, so settlement is fully self-contained.
+
+---
+
+### M-02 — `FixedPointMath.mulDiv()` uses a single unguarded multiplication, causing DoS via overflow for large accumulations
+
+**File:** `src/libraries/FixedPointMath.sol`, `mulDiv()` (line 14)
+
+**What an attacker can do:** If `x * y` overflows `uint256`, the call reverts. A sufficiently large `globalIndex` (from many large `notifyReward` calls) combined with a large share balance causes `_pendingFor` to overflow, permanently bricking `claim()` for affected accounts and making any further `notifyReward` revert.
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // intermediate overflow reverts
+}
+```
+
+The comment acknowledges this ("checked by the 0.8.x arithmetic rules"), but the consequence is a silent DoS rather than a graceful error. The threshold is `x * y > 2²⁵⁶ − 1`. With `WAD = 1e18` and `globalIndex` accumulating over time, the ceiling for `amount` in `notifyReward` before overflow is `~1.15 × 10⁵⁹` tokens — high but reachable if the contract is used over years with many small-supply reward tokens expressed in wei.
+
+**Conditions required:** Cumulative product of any `mulDiv` call's inputs exceeds `type(uint256).max`. Most likely to occur in `_pendingFor` or `notifyReward` after a large number of reward notifications.
+
+**Fix:** Replace the naive multiply-then-divide with a 512-bit overflow-safe `mulDiv` (e.g., the Solady or OpenZeppelin implementation using the `mulmod` opcode for full-width arithmetic).
+
+---
+
+## Low
+
+### L-01 — `Ownable2Step.transferOwnership()` silently accepts `address(0)` as the nominee
+
+**File:** `src/auth/Ownable2Step.sol`, `transferOwnership()` (line 30)
+
+**What happens:** `transferOwnership(address(0))` sets `pendingOwner = address(0)`. Because `acceptOwnership` checks `msg.sender != pendingOwner` and `address(0)` can never be `msg.sender`, this effectively cancels any in-flight transfer without reverting. The behavior is undocumented and differs from what an operator might expect (many implementations revert here).
+
+**Conditions required:** Owner accidentally (or deliberately) passes `address(0)`.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` to `transferOwnership`, or document the "cancel" semantic explicitly.
+
+---
+
+### L-02 — Reentrancy guards use the 0 / 1 scheme instead of 1 / 2, paying extra gas on every protected call
+
+**Files:** `src/core/StakingVault.sol` (line 59, 77–82); `src/rewards/RewardDistributor.sol` (line 46, 58–63)
+
+**What happens:** `_entered` starts at 0 (zero-initialized storage), is set to 1 on entry, and reset to 0 on exit. The reset (`SSTORE nonzero → zero`) incurs an extra ~15 000 gas versus the 1 / 2 scheme (where both writes are `nonzero → nonzero` at ~2 900 gas each after the slot is warm). This affects every call to `deposit`, `requestWithdrawal`, `completeWithdrawal`, `accrueYield`, `notifyReward`, and `claim`.
+
+**Fix:** Initialize `_entered = 1` in the constructor (or as a storage default via a constant), use 2 as the "entered" sentinel, and reset to 1 on exit.
+
+---
+
+## Informational
+
+### I-01 — `accrueYield` updates `totalAssets` before calling `safeTransferFrom` (minor CEI deviation)
+
+**File:** `src/core/StakingVault.sol`, `accrueYield()` (line 187)
+
+`totalAssets` is incremented before the token pull. If the transfer reverts the transaction rolls back cleanly, but if the token supports pull callbacks (ERC-777 `tokensToSend`), the hook fires with `totalAssets` already reflecting the yield, briefly inflating the share price observable by read-only callers within that hook. This is not exploitable with standard ERC-20 but is worth noting for non-standard tokens.
+
+---
+
+### I-02 — No `maxCooldown` bound in `StakingVault` constructor
+
+**File:** `src/core/StakingVault.sol`, constructor (line 89)
+
+`cooldown_` is a `uint64` with no upper bound check. A deployer could accidentally pass a value large enough to lock all withdrawals for decades. A sanity cap (e.g., 30 days) would prevent this class of deployment error.
+
+---
+
+## Summary Table
+
+| ID   | Severity    | File                              | Title                                                      |
+|------|-------------|-----------------------------------|------------------------------------------------------------|
+| C-01 | Critical    | `rewards/RewardDistributor.sol`   | `claim()` never zeros `accrued`, enabling unlimited drain  |
+| H-01 | High        | `rewards/RewardDistributor.sol`   | Cross-contract reentrancy amplifies C-01 with hook tokens  |
+| M-01 | Medium      | `core/StakingVault.sol`           | Live `feeRecipient` read can brick fee-bearing withdrawals |
+| M-02 | Medium      | `libraries/FixedPointMath.sol`    | Unguarded multiplication; DoS via overflow                 |
+| L-01 | Low         | `auth/Ownable2Step.sol`           | `transferOwnership(address(0))` silently cancels transfer  |
+| L-02 | Low         | `StakingVault`, `RewardDistributor` | 0/1 reentrancy guard wastes gas on every call            |
+| I-01 | Info        | `core/StakingVault.sol`           | CEI deviation in `accrueYield` (non-standard tokens only)  |
+| I-02 | Info        | `core/StakingVault.sol`           | No upper bound on `cooldown_` in constructor               |
+
+The most urgent fix is **C-01**: add `accrued[msg.sender] = 0;` inside `claim()` before the transfer. Everything else can be addressed in a follow-up pass, with M-01 and M-02 as the next priorities if the vault is intended to support non-standard ERC-20 tokens.

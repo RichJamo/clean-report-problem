@@ -44,7 +44,6 @@ ACCOUNTING_TERMS = [
     "globalIndex",
     "notifyReward",
     "userIndex",
-    "claimable",
     "totalNotified",
 ]
 ALL_TERMS = IDENTITY_TERMS + ACCOUNTING_TERMS

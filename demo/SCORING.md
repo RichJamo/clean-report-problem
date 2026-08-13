@@ -39,6 +39,22 @@ String search for `ABSENT` is case-insensitive over the raw output. A run is
 split and the detection call require reading the surrounding text and are made
 by hand.
 
+> **Amendment, made after the runs, and in the direction that flatters the
+> result. Read this one sceptically.** `claimable` was removed from the
+> accounting terms. It is not distributor-specific in practice: one report used
+> the phrase "a separate claimable accumulator" while recommending a fix to the
+> *fee* path, and another contained it inside the word "unclaimable".
+>
+> This changes exactly one run's classification, `t3b-claudemd-10`, from
+> `EXAMINED` to `MENTIONED` — which strengthens the headline comparison. The
+> justification does not rest on the term list: that run's tool log records
+> **zero** opens of `src/rewards/RewardDistributor.sol`, so classifying it as
+> having engaged with the file's contents was wrong on independent evidence. The
+> word `claimable` never appears in it in reference to the distributor at all.
+>
+> `RESULTS.md` reports the affected figure both ways so the effect of this
+> decision is visible rather than absorbed. No other run in the set changes.
+
 > **Amendment, made before any run was executed.** The first draft of this list
 > included the bare term `accrued`. It was removed: `StakingVault` exposes
 > `accrueYield`, so an output discussing vault yield could contain "accrued"

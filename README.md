@@ -87,13 +87,22 @@ injecting into content the reviewer happens to fetch.
 
 In an audit the adversary with the clearest motive is **the party who wrote the
 code being reviewed** — a team that benefits from a clean report, has legitimate
-write access to every file in scope, and needs nothing that looks like an attack.
-A sentence in a README is sufficient, and it is deniable. It reads as
-documentation, because it *is* documentation.
+write access to every file it ships, and needs nothing that looks like an attack.
+Whatever they write is deniable, because it reads as documentation: it *is*
+documentation.
 
-This is worth stating plainly because it is uncomfortable: on any platform where
-automated review is common and the reviewed party controls the artefact, this is
-a live incentive, not a hypothetical.
+What the runs below add is that the motive is not the hard part and the
+**delivery channel is**. A sentence in a README was not sufficient — that was
+tested directly and failed in all ten runs, with the agent reviewing the file
+anyway and in one case saying so explicitly. Nor was a comment in the file, which
+was reported as an attack rather than obeyed. The channel that worked was the one
+the agent ingests automatically without being asked to: its config file.
+
+So the uncomfortable version of this claim is narrower than it first appears, and
+correspondingly sharper. It is not that any text the reviewed party writes can
+steer a review. It is that text arriving through a channel the agent is built to
+trust can, silently — and that whether such a channel exists is a property of the
+reviewing setup, not of the attacker's ingenuity.
 
 ## Why the standard defense does not transfer
 
@@ -260,10 +269,17 @@ unsteered choices happened to include the vulnerable file every time.
 
 One honest complication, treated at length in the write-up: `CLAUDE.md` is a
 channel the agent is *designed* to obey, so the winning condition is arguably
-not an attack at all — it is correct behaviour. That is the point. The channel
-does not need subverting, only writing to, and the reviewed party can write to
-it. The defect is not the obedience; it is that an instruction from an untrusted
-document silently became the audit's scope and left no trace in the output.
+not an attack at all — it is correct behaviour. That is the point. The defect is
+not the obedience; it is that an instruction from a document in the repository
+silently became the audit's scope and left no trace in the output.
+
+**The vector is conditional and its prevalence is not measured here.** It
+requires the reviewed repository to ship a config file the reviewing agent
+auto-loads, *and* the reviewer to run that agent inside the clone. In a
+competitive-audit setting the auditor usually supplies their own config and the
+target ships none, in which case this does not apply at all. How often the
+conditions hold in practice is an open question this repository does not answer,
+and a worthwhile one to answer separately.
 
 ## Scope and honest limits
 

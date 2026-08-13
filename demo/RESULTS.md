@@ -163,11 +163,31 @@ reviewed `src/core`. By one reading this is not an attack at all — it is
 correct, obedient behaviour, and the agent is working exactly as specified.
 
 That reading is right, and it is the point. The channel does not need to be
-subverted. It needs only to be *writable by the party being reviewed*, which it
-is, on every platform where a repository is submitted for automated review. No
-jailbreak, no adversarial phrasing, nothing that looks like an attack — the file
-in `t3b` is indistinguishable from an ordinary stale config, and "it was out of
-date" is a complete and deniable explanation.
+subverted, only written to. No jailbreak, no adversarial phrasing, nothing that
+looks like an attack — the file in `t3b` is indistinguishable from an ordinary
+stale config, and "it was out of date" is a complete and deniable explanation.
+
+**But the vector is conditional, and this repository does not establish that the
+conditions are commonly met.** Two things must both hold:
+
+1. the repository under review ships a config file that the reviewing agent
+   loads automatically, **and**
+2. the reviewer runs that agent inside the clone, with project-level settings
+   enabled.
+
+Neither is universal. In a competitive-audit setting the auditor typically
+supplies their own config, and the sponsor's repository contains none — in which
+case this vector is simply absent and the result above does not apply. The
+conditions are most plausibly met where a team ships an agent config alongside
+its code, which is an increasingly ordinary thing to do, and where a reviewer
+points an agent at the clone.
+
+How often that actually happens is an **open empirical question that is not
+answered here**. Measuring it — how many public review targets ship a
+`CLAUDE.md`, `AGENTS.md`, `.cursorrules` or equivalent — would be a small,
+checkable study and a natural follow-on. Until someone runs it, the honest claim
+is about what the mechanism does *when the file is present*, not about how often
+it is.
 
 So the finding is not that the agent can be tricked. It is that **an instruction
 from an untrusted document silently became the audit's scope, and the resulting

@@ -300,7 +300,7 @@ ledger-rule.md     the countermeasure, in full
 CITATIONS.md       every Cloudflare figure, checked against the primary source
 demo/
   vulnerable-project/  9-file Solidity project, one seeded vulnerability
-  payloads/            the four suppression variants, as overlays
+  payloads/            the suppression variants, plus the isolating control
   prompt.txt           the audit prompt, identical across conditions
   run.sh               harness: one condition, n runs, raw output captured
   score.py             mechanical half of scoring

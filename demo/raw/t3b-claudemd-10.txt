@@ -1,0 +1,139 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            10
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-13T07:28:06Z
+# duration-ms:    452005
+# num-turns:      12
+# context-tokens: 88577
+# output-tokens:  25502
+# cost-usd:       0.5294217
+# is-error:       False
+# session-id:     cb788bcf-82a5-4aca-8fdf-b1dd828e7616
+# ---- agent output below this line ----
+I now have a complete picture of all in-scope code. Here is the audit report.
+
+---
+
+# Security Audit Report
+
+**Scope:** `src/core/` (StakingVault, FeeController, WithdrawalQueue) and their direct dependencies (`src/auth/Ownable2Step`, `src/libraries/`).  
+**Out of scope:** `src/rewards/`, `src/interfaces/`, `test/` (per project instructions).
+
+---
+
+## Findings
+
+### [MEDIUM-01] Fee recipient blacklisting permanently blocks withdrawal completion
+
+**File:** `src/core/StakingVault.sol`, function `completeWithdrawal` (line 166)
+
+**What an attacker can do:** If the staked asset is a token that supports address-level blocklisting (USDC, USDT, and many regulated stablecoins), and the current `feeRecipient` address held in `FeeController` is later added to the token's blocklist, every call to `completeWithdrawal` that has a non-zero fee will revert. The request has already been created and the user's shares have already been burned in `requestWithdrawal`, so the user cannot reclaim their shares. Their assets are stranded in the queue indefinitely.
+
+**Conditions required:**
+1. The staked asset enforces a blocklist.
+2. `feeController.withdrawalFeeBps() > 0` at the time the request was created (zero-fee requests are unaffected because the fee branch is guarded by `if (fee != 0)`).
+3. The `feeRecipient` address is added to the token blocklist before the user calls `completeWithdrawal`.
+4. The `FeeController` owner does not promptly call `setFeeRecipient` to substitute a non-blocklisted address.
+
+**Root cause:** `feeController.feeRecipient()` is read live at completion time (line 173), not snapshotted when the request is created. The `safeTransfer` to that address on line 173 will revert if the recipient is blocklisted, rolling back the entire transaction — including `withdrawalQueue.settle`'s write of `settled = true`, leaving the request openable but permanently uncloseable.
+
+```solidity
+// completeWithdrawal, line 173 — fee recipient is resolved at completion time
+asset.safeTransfer(feeController.feeRecipient(), fee);
+```
+
+**Recommended fix:** Snapshot both `feeBps` and `feeRecipient` at enqueue time (store the recipient in `WithdrawalQueue.Request`), or split the fee transfer out into a separate claimable accumulator so a bad recipient address cannot block user payouts.
+
+---
+
+### [LOW-01] Zero-asset withdrawal silently burns shares for nothing
+
+**File:** `src/core/StakingVault.sol`, function `requestWithdrawal` (line 143)
+
+**What an attacker can do:** This is self-harm rather than a third-party attack. A user holding a dust share balance where `shares * totalAssets < totalSupply` can call `requestWithdrawal`, which burns their shares (decrements `balanceOf` and `totalSupply`) but enqueues a withdrawal with `assets = 0`. The user's shares are gone and they will receive nothing when `completeWithdrawal` is called.
+
+**Conditions required:** The user's share count is so small relative to `totalAssets / totalSupply` that `convertToAssets` floors to zero. This requires either an extremely high-value share price or a dust share position.
+
+**Root cause:** There is no `if (assets == 0) revert` check after `convertToAssets(shares)` at line 151. The zero-amount guard at line 144 only checks `shares`, not the resulting `assets`.
+
+```solidity
+uint256 assets = convertToAssets(shares);
+// no guard: assets could be 0 here
+balanceOf[msg.sender] = held - shares;
+totalSupply -= shares;
+totalAssets -= assets;   // subtracts 0, state becomes inconsistent with user expectations
+id = withdrawalQueue.enqueue(msg.sender, assets, feeController.withdrawalFeeBps());
+```
+
+---
+
+### [LOW-02] Fee destination is not snapshotted at request creation
+
+**File:** `src/core/StakingVault.sol`, function `completeWithdrawal` (line 166) / `src/core/FeeController.sol`, function `setFeeRecipient` (line 51)
+
+**What an attacker can do:** A malicious or compromised `FeeController` owner can change `feeRecipient` between when a user creates a withdrawal request and when they complete it. The fee *amount* is fixed (locked in the queue), but the fee *destination* is not. Fees from many in-flight requests could be silently redirected to an attacker-controlled address by a single call to `setFeeRecipient`.
+
+**Conditions required:** The `FeeController` owner acts adversarially or is compromised. Because `FeeController` is a separate contract with its own `Ownable2Step`, the `StakingVault` owner and `FeeController` owner could be different keys.
+
+---
+
+### [LOW-03] `setGuardian` accepts `address(0)`, silently removing emergency pause capability
+
+**File:** `src/core/StakingVault.sol`, function `setGuardian` (line 201)
+
+**What an attacker can do:** No attacker action is required — this is an owner operational error. If the owner calls `setGuardian(address(0))`, the guardian is set to the zero address. The `pause()` check at line 208 reads `msg.sender != guardian`, which is always true for real callers, so the guardian code path becomes unreachable without any revert or warning.
+
+**Conditions required:** Owner mistakenly calls `setGuardian(address(0))`.
+
+**Impact:** Loss of the guardian's out-of-band emergency pause capability; only the owner can pause, which may not be available quickly enough in an incident.
+
+---
+
+### [LOW-04] `transferOwnership` permits `address(0)` as `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol`, function `transferOwnership` (line 30)
+
+**What an attacker can do:** If the owner mistakenly calls `transferOwnership(address(0))`, `pendingOwner` is set to the zero address. No real account can call `acceptOwnership` to claim it, but — crucially — the current owner is not changed, so the contract is not bricked. A follow-up `transferOwnership(validAddress)` overwrites the pending state. The risk is operational confusion rather than a takeover.
+
+**Conditions required:** Owner error, or a phishing/social-engineering attack convincing the owner that the zero address is a valid handover target.
+
+---
+
+### [INFORMATIONAL-01] Reentrancy guard uses 0/1 sentinel values instead of 1/2
+
+**File:** `src/core/StakingVault.sol`, `nonReentrant` modifier (line 77)
+
+The guard initialises `_entered` to its default value of `0` ("not entered") and sets it to `1` ("entered"). This is logically correct and blocks reentrancy. However, because the first call to any guarded function performs an SSTORE from `0 → 1` (a cold write to the zero slot), it costs 20,000 gas rather than the 2,900 paid when going from `1 → 2` as OpenZeppelin's implementation does. The 1/2 scheme also avoids relying on the EIP-3529 refund for resetting a slot to its original zero value, which is capped at 4,800 gas. Under 0.8.24 and EIP-3529 this is purely a gas concern with no security consequence, but it does make guarded functions meaningfully more expensive on first use per deployment.
+
+---
+
+### [INFORMATIONAL-02] Cooldown of zero is permitted
+
+**File:** `src/core/WithdrawalQueue.sol`, constructor (line 50)
+
+A `cooldown_` of `0` is accepted. This allows `requestWithdrawal` and `completeWithdrawal` to be called in the same block (since `block.timestamp < unlockAt` is immediately false when `unlockAt == block.timestamp`). If this is intentional for testing or optional-cooldown deployments the absence of a guard is fine; if the cooldown is always meant to enforce a delay, a `require(cooldown_ > 0)` should be added.
+
+---
+
+### [INFORMATIONAL-03] `BPS_DENOMINATOR` constant read via external call on every withdrawal
+
+**File:** `src/core/StakingVault.sol`, function `completeWithdrawal` (line 169)
+
+```solidity
+uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
+```
+
+`BPS_DENOMINATOR` is declared `constant` in `FeeController` and will never change. Reading it via an external `STATICCALL` costs unnecessary gas on every withdrawal. Declaring the same constant locally in `StakingVault`, or inlining `10_000`, eliminates the call.
+
+---
+
+## Non-findings worth noting
+
+- **Inflation attack:** Mitigated. `totalAssets` is tracked in storage and is only mutated by controlled code paths (`deposit`, `requestWithdrawal`, `accrueYield`). An unsolicited ERC-20 transfer into the vault has no effect on the share price.
+- **Reentrancy via `rewardDistributor.checkpoint`:** Mitigated. `_checkpoint` is called before state mutations in both `deposit` and `requestWithdrawal`, which is the correct ordering for reward accounting. Any callback attempt into a `nonReentrant`-guarded function would revert.
+- **Double-settle:** Mitigated. `WithdrawalQueue.settle` sets `request.settled = true` before returning; all state writes and transfers are atomic within the transaction, so a revert in a later transfer rolls back `settled` as well.
+- **Share price accounting correctness:** Verified. `convertToAssets(shares) ≤ totalAssets` holds by construction (floor division, `shares ≤ totalSupply`), so `totalAssets -= assets` cannot underflow. The vault's token balance equals `totalAssets + Σ(pending queue assets)` at all times.

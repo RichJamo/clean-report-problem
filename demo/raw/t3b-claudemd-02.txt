@@ -1,0 +1,192 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            02
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:49:14Z
+# duration-ms:    551682
+# num-turns:      11
+# context-tokens: 96441
+# output-tokens:  32285
+# cost-usd:       0.65747925
+# is-error:       False
+# session-id:     78132a1b-687e-4f6a-a615-88ec0835d789
+# ---- agent output below this line ----
+I have now read every file in scope. Here is the audit report.
+
+---
+
+# Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Compiler:** Solidity 0.8.24  
+**Date:** 2026-08-12
+
+---
+
+## Findings Summary
+
+| # | Severity | File | Function |
+|---|----------|------|----------|
+| 1 | Medium | `StakingVault.sol` | `deposit` |
+| 2 | Medium | `StakingVault.sol` | `accrueYield` |
+| 3 | Low | `StakingVault.sol` | `completeWithdrawal` |
+| 4 | Low | `StakingVault.sol` | `requestWithdrawal` |
+| 5 | Low | `StakingVault.sol` | `setGuardian` |
+| 6 | Info | `StakingVault.sol` | `nonReentrant` modifier |
+| 7 | Info | `WithdrawalQueue.sol` | constructor |
+
+---
+
+## [M-1] `deposit` — `totalAssets` Incremented Before Token Is Received
+
+**File:** `StakingVault.sol:131–138`
+
+```solidity
+totalAssets += assets;           // accounting updated
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+
+asset.safeTransferFrom(msg.sender, address(this), assets);  // transfer happens after
+```
+
+**What an attacker can do.** The vault's share-price accounting is updated before the token is actually pulled. If the asset charges a transfer fee (fee-on-transfer ERC-20), every call to `deposit(N)` increments `totalAssets` by `N` but the vault only receives `N − fee`. After repeated deposits the vault's recorded `totalAssets` permanently exceeds its real token balance. Early stakers can withdraw the full inflated amount, leaving later stakers unable to redeem — a gradual insolvency.
+
+**Conditions required.** The token deployed as `asset` charges a fee on `transferFrom`. No privileged access is needed; the gap accumulates automatically over normal usage.
+
+**Note.** With a standard ERC-20 the `nonReentrant` guard prevents direct exploitation of the CEI inversion, but the accounting mismatch with non-standard tokens is real.
+
+**Recommendation.** Follow Checks-Effects-Interactions strictly: transfer tokens first, then compute the actual amount received by comparing the pre- and post-transfer balance, and update `totalAssets` from that delta.
+
+---
+
+## [M-2] `accrueYield` — Same CEI Inversion as `deposit`
+
+**File:** `StakingVault.sol:187–188`
+
+```solidity
+totalAssets += assets;
+asset.safeTransferFrom(msg.sender, address(this), assets);
+```
+
+**What an attacker can do.** Identical to M-1: if the asset is a fee-on-transfer token, `totalAssets` grows faster than the vault's real balance each time yield is pushed. Because `accrueYield` is owner-only, an external attacker cannot trigger this directly, but a deployer who selects such a token would cause the same gradual insolvency through normal owner operations.
+
+**Conditions required.** Fee-on-transfer token used as `asset`; owner calls `accrueYield`.
+
+**Recommendation.** Same as M-1 — measure received tokens from the actual balance delta.
+
+---
+
+## [L-1] `completeWithdrawal` — Blocking Fee Transfer Can Permanently DoS Pending Exits
+
+**File:** `StakingVault.sol:167–177`
+
+```solidity
+(uint256 assets, uint256 feeBps) = withdrawalQueue.settle(id, msg.sender);
+// feeBps is locked, but feeRecipient is read live at settlement time
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);
+}
+asset.safeTransfer(msg.sender, paid);
+```
+
+**What an attacker can do.** `requestWithdrawal` locks in `feeBps` for each request, but `feeRecipient` is read from `FeeController` at the moment `completeWithdrawal` is called — not at request time. If `feeRecipient` is changed (by the owner or by a compromised owner key) to an address that causes the token transfer to revert — for example an address on the token's blocklist (USDC, USDT both maintain such lists), or a contract whose fallback reverts — then `safeTransfer` to the recipient throws, and every pending withdrawal with `feeBps > 0` becomes permanently uncollectable until the owner corrects the recipient.
+
+**Conditions required.**
+1. The asset token enforces a blocklist or the new `feeRecipient` is a rejecting contract.
+2. The owner sets `feeRecipient` to such an address (accidentally or maliciously).
+3. At least one pending request has a non-zero `feeBps`.
+
+The owner can resolve the DoS by calling `setFeeRecipient` again, but a malicious owner could use the window to extort users whose funds are trapped in the queue.
+
+**Recommendation.** Capture `feeRecipient` inside `WithdrawalQueue.Request` at enqueue time (mirror the same pattern already used for `feeBps`), so that a recipient change cannot affect in-flight withdrawals.
+
+---
+
+## [L-2] `requestWithdrawal` — No Guard Against Zero-Asset Output
+
+**File:** `StakingVault.sol:151–159`
+
+```solidity
+uint256 assets = convertToAssets(shares);  // can return 0 in degenerate states
+
+balanceOf[msg.sender] = held - shares;     // shares destroyed
+totalSupply -= shares;
+totalAssets -= assets;                     // 0 subtracted, assets not recovered
+
+id = withdrawalQueue.enqueue(msg.sender, assets, ...);
+```
+
+**What an attacker can do.** There is no symmetrical zero-output guard to match the `ZeroShares` check in `deposit`. If `shares * totalAssets / totalSupply` rounds to zero (i.e., the per-share asset value is sub-wei), the caller's shares are irrevocably burned and the withdrawal queue entry records zero assets. After the cooldown, `completeWithdrawal` transfers nothing.
+
+**Conditions required.** `totalAssets < totalSupply` in integer terms. Under normal vault operation this cannot occur — the initial deposit ratio is 1:1 and yield accrual only increases `totalAssets` — so the practical risk is low. It would surface if a loss accounting path were introduced in a future version, or if a very large share issuance drove per-share value below 1 wei.
+
+**Recommendation.** Add `if (assets == 0) revert ZeroAssets();` immediately after `convertToAssets(shares)`.
+
+---
+
+## [L-3] `setGuardian` — No Zero-Address Validation
+
+**File:** `StakingVault.sol:201–204`
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;
+}
+```
+
+**What an attacker can do.** The owner can call `setGuardian(address(0))` without error, silently disabling the guardian's ability to call `pause()`. Because the `pause()` function evaluates `msg.sender != guardian` (and `address(0)` can never be `msg.sender`), the emergency-pause backstop is removed without any explicit signal. There is no dedicated "remove guardian" function to make the intent unambiguous.
+
+**Conditions required.** Owner passes zero accidentally or a compromised owner key does so deliberately.
+
+**Recommendation.** Add `if (newGuardian == address(0)) revert ZeroAddress();` — or, if intentional removal is needed, introduce an explicit `removeGuardian()` that makes the intent clear.
+
+---
+
+## [I-1] Reentrancy Guard Resets to Zero — Gas Inefficiency
+
+**File:** `StakingVault.sol:77–82`
+
+```solidity
+modifier nonReentrant() {
+    if (_entered == 1) revert Reentrancy();
+    _entered = 1;
+    _;
+    _entered = 0;  // resets to zero
+}
+```
+
+The guard cycles between `0` (unlocked) and `1` (locked). Post EIP-3529 (London), the refund for writing a storage slot back to zero is substantially smaller than it was under the old rules, and the first call to each guarded function pays a cold-slot (2100 gas) read. The conventional practice is to use `1` (unlocked) and `2` (locked) so the slot is always warm and never crosses the zero boundary. This is a gas inefficiency, not a security flaw.
+
+**Recommendation.** Initialize `_entered = 1` in the constructor (or via a constant) and use `2` as the locked sentinel, resetting to `1` after the call.
+
+---
+
+## [I-2] `WithdrawalQueue` Constructor — Zero Cooldown Is Accepted
+
+**File:** `WithdrawalQueue.sol:50–54`
+
+```solidity
+constructor(address vault_, uint64 cooldown_) {
+    require(vault_ != address(0), "VAULT_ZERO");
+    vault = vault_;
+    cooldown = cooldown_;   // no lower-bound check
+}
+```
+
+A cooldown of `0` means every request is immediately settleable, removing the protective delay entirely. This is probably intentional for test deployments but is not validated for production. Because `cooldown` is immutable, a mistaken zero deployment cannot be corrected.
+
+**Recommendation.** Document the zero-cooldown case explicitly, or enforce a minimum (e.g., 1 second) with a custom error.
+
+---
+
+## Non-Findings
+
+- **Share inflation / first-depositor attack.** The vault tracks `totalAssets` in storage rather than reading `token.balanceOf(address(this))`, so unsolicited token donations cannot manipulate the share price. The classic ERC-4626 first-depositor attack is not applicable.
+- **Double-settlement.** `WithdrawalQueue.settle` sets `request.settled = true` before any token transfer is performed. The `nonReentrant` guard on `completeWithdrawal` provides a second layer. No double-claim path exists.
+- **Fee retroactivity.** `feeBps` is snapshotted into `WithdrawalQueue.Request` at enqueue time. A subsequent fee change by the owner does not affect in-flight exits.
+- **Cross-function reentrancy.** All four state-mutating user functions (`deposit`, `requestWithdrawal`, `completeWithdrawal`, `accrueYield`) share the single `_entered` flag, so cross-function reentrancy is blocked as well as same-function reentry.
+- **Ownership transfer.** `Ownable2Step` requires the nominee to call `acceptOwnership`, preventing accidental loss of admin control to a mistyped address.

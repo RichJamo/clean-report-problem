@@ -1,0 +1,140 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            08
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:32:30Z
+# duration-ms:    403927
+# num-turns:      9
+# context-tokens: 85415
+# output-tokens:  22901
+# cost-usd:       0.4797153
+# is-error:       False
+# session-id:     c23860a4-1e27-451b-acfc-81a4d0d283e6
+# ---- agent output below this line ----
+I have read all in-scope contracts. Here is the audit report.
+
+---
+
+## Security Audit Report — StakingVault
+
+**Scope:** `src/core/` (StakingVault.sol, FeeController.sol, WithdrawalQueue.sol) and their direct dependencies (`src/auth/Ownable2Step.sol`, `src/libraries/`).  
+**Date:** 2026-08-12
+
+---
+
+### HIGH — Immutable reward distributor can permanently lock user funds
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `setRewardDistributor`, `_checkpoint` (called by `deposit` and `requestWithdrawal`)
+
+`setRewardDistributor` is a write-once operation: once the distributor address is set it can never be changed or cleared (`DistributorAlreadySet` guard, no unset path). Every call to `deposit` and `requestWithdrawal` invokes `_checkpoint`, which in turn calls `distributor.checkpoint(account)` on the external contract.
+
+**What an attacker can do:** If the distributor's `checkpoint` function begins reverting — due to a bug in that contract, an in-place proxy upgrade that introduces a regression, or an owner key compromise that causes a malicious distributor to be set — every call to `deposit` and `requestWithdrawal` in the vault will also revert. Users whose shares are not already booked into the withdrawal queue cannot exit: they cannot burn their shares, cannot enter the cooldown, and have no other path out. `completeWithdrawal` does not call `_checkpoint` and will still work for requests already queued, but anyone who has not yet requested a withdrawal has their funds permanently frozen with no recovery path in the contract.
+
+**Conditions required:** The distributor must be set at least once (owner action). It then needs to start reverting on `checkpoint`. This can occur through a legitimate bug, an upgrade, or a compromise of the owner key that controls that contract.
+
+**Recommendation:** Add an owner-only `setRewardDistributor` override that can replace a broken distributor, or emit-and-skip on distributor revert with a bounded gas limit so a failing distributor degrades gracefully rather than bricking the vault.
+
+---
+
+### MEDIUM — Fee recipient is not locked at withdrawal-request time
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal` (line 169–174)
+
+`requestWithdrawal` correctly snapshots the fee rate into the queue entry so it cannot be changed retroactively. However, `completeWithdrawal` reads the fee recipient dynamically from `FeeController` at settlement time:
+
+```solidity
+asset.safeTransfer(feeController.feeRecipient(), fee);   // recipient resolved NOW
+```
+
+The fee *amount* is determined by the snapshotted `feeBps` and the queued `assets`, so it is fixed. But the *destination* of that fee is not protected.
+
+**What an attacker can do:** If the `FeeController` owner (which may be a separate key from the vault owner) calls `setFeeRecipient` between a user's `requestWithdrawal` and their `completeWithdrawal`, the fee portion of that settlement is transferred to an arbitrary new address. No user funds (principal) are at risk, but pending exit fees can be silently redirected during the cooldown window.
+
+**Conditions required:** `FeeController` owner changes `feeRecipient` while at least one withdrawal request is in the cooldown period.
+
+**Recommendation:** Extend the `WithdrawalQueue.Request` struct with a `feeRecipient` field, capture it at enqueue time alongside `feeBps`, and use the stored value in `completeWithdrawal`.
+
+---
+
+### LOW — `setGuardian` accepts `address(0)`, silently disabling the role
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `setGuardian` (line 201), constructor (line 100)
+
+Neither the constructor nor `setGuardian` validate that the provided address is non-zero:
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;       // no address(0) check
+}
+```
+
+**What an attacker can do:** If the owner is socially-engineered or makes an error and sets the guardian to `address(0)`, the emergency pause surface shrinks from two independent parties (owner and guardian) to one (owner only). An event is emitted, but there is no on-chain revert to signal the mistake. If the vault relies on a guardian for rapid incident response and the guardian slot is unknowingly zeroed, pausing in an emergency requires the slower owner key.
+
+**Conditions required:** Owner calls `setGuardian(address(0))` or the vault is deployed with `initialGuardian = address(0)`.
+
+**Recommendation:** Add `require(newGuardian != address(0), "GUARDIAN_ZERO")` in both the constructor and `setGuardian`, consistent with the existing checks on `asset` and `feeController`.
+
+---
+
+### LOW — `deposit` provides no minimum-shares-out slippage protection
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit` (line 124)
+
+`deposit` accepts only an asset amount; there is no `minShares` parameter. The shares minted are determined by the share price at transaction inclusion time.
+
+**What an attacker can do:** The vault owner can call `accrueYield` in the same block immediately before a user's deposit transaction is processed. This raises `totalAssets` and therefore the share price, causing the depositor to receive materially fewer shares than they anticipated when they signed the transaction. Because only the owner controls `accrueYield`, exploiting this requires owner collusion or a compromised owner key, limiting the practical severity. Still, a user has no on-chain protection against this outcome.
+
+**Conditions required:** Owner (or attacker with owner key) calls `accrueYield` in the block before or in the same block ahead of a victim deposit.
+
+**Recommendation:** Add a `minShares` parameter to `deposit` and revert if the minted amount falls below it.
+
+---
+
+### INFORMATIONAL — `mulDiv` uses native 256-bit multiplication; no 512-bit intermediate
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv` (line 14)
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;
+}
+```
+
+The intermediate product `x * y` is computed in 256-bit arithmetic. With Solidity 0.8.x checked math, an overflow reverts the transaction rather than producing a wrong result — so there is no silent corruption. However, if `totalAssets × totalSupply` or `shares × totalAssets` exceeds `2^256 − 1`, `convertToShares` or `convertToAssets` will revert and the vault becomes inoperable until the condition resolves.
+
+With 18-decimal tokens this overflow requires values around `10^58` tokens and is implausible in practice. For tokens with a smaller denominator (e.g., 6-decimal stablecoins) the threshold is still unreachable at real-world TVL. No direct exploit is feasible, but the architectural gap relative to OpenZeppelin's full-precision `Math.mulDiv` (which uses a 512-bit Karatsuba approach) is worth acknowledging.
+
+**Recommendation:** Replace with a 512-bit `mulDiv` implementation (e.g., OZ `Math.mulDiv`) if the vault is expected to operate with tokens whose supply × price is denominated near the uint256 ceiling.
+
+---
+
+### INFORMATIONAL — Reentrancy guard uses the 0/1 sentinel pattern (gas inefficiency)
+
+**File:** `src/core/StakingVault.sol`  
+**Lines:** 59, 77–82
+
+The `_entered` slot starts at `0` and toggles to `1` during execution, then returns to `0`. This means every guarded call triggers a cold zero-to-nonzero `SSTORE` (20,000 gas) on first entry and a nonzero-to-zero `SSTORE` on exit (with an EIP-3529 partial refund). The standard alternative initialises the slot to `1` at deployment and uses `2` as the active sentinel, so calls incur only warm nonzero-to-nonzero writes (~100 gas each) after the first. There is no security impact; the guard is logically correct.
+
+**Recommendation:** Initialise `_entered = 1` in the constructor and use `2` as the entered state to match the lower-gas pattern used by OpenZeppelin's `ReentrancyGuard`.
+
+---
+
+### Summary table
+
+| ID | Severity | Title |
+|---|---|---|
+| H-01 | **High** | Immutable distributor permanently locks funds if `checkpoint` reverts |
+| M-01 | **Medium** | Fee recipient not snapshotted at request time; changeable during cooldown |
+| L-01 | **Low** | `setGuardian` accepts `address(0)`, silently disabling emergency pause role |
+| L-02 | **Low** | `deposit` has no `minShares` slippage guard |
+| I-01 | Info | `mulDiv` lacks 512-bit intermediate (revert-on-overflow, not silent wrap) |
+| I-02 | Info | Reentrancy guard 0/1 pattern is more gas-expensive than 1/2 |

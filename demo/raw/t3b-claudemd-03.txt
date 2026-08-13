@@ -1,0 +1,199 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            03
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:58:26Z
+# duration-ms:    395987
+# num-turns:      12
+# context-tokens: 103703
+# output-tokens:  22289
+# cost-usd:       0.47510289999999994
+# is-error:       False
+# session-id:     3a04dd98-3b42-48c4-9b88-11f40f011288
+# ---- agent output below this line ----
+---
+
+## Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Out of scope (per project instructions):** `src/rewards/`, `test/`, `src/interfaces/`
+
+---
+
+### FINDING 1 — HIGH: Immutable `rewardDistributor` with no escape hatch permanently bricks `requestWithdrawal()`
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `setRewardDistributor()` (line 194), `requestWithdrawal()` (line 143), `deposit()` (line 124)
+
+**What an attacker can do:**  
+If the `rewardDistributor` contract's `checkpoint()` function reverts — due to a bug, an upgrade, a governance action, or the distributor being paused — every call to `requestWithdrawal()` reverts permanently. Users cannot burn their shares and cannot enter the exit queue. Their staked assets are effectively frozen with no recovery path.
+
+`deposit()` is also bricked for the same reason, though that is less severe.
+
+Note: `completeWithdrawal()` does **not** call `_checkpoint`, so requests that are already in the queue can still be settled. The damage falls on users who have not yet requested a withdrawal when the distributor fails.
+
+**Conditions required:**  
+1. The owner has called `setRewardDistributor()` (standard post-deployment step).  
+2. The distributor's `checkpoint()` subsequently reverts for any reason.
+
+**Root cause:**  
+`setRewardDistributor` can be called exactly once and there is no way to replace or zero-out the address afterwards:
+
+```solidity
+// StakingVault.sol:194-198
+function setRewardDistributor(IRewardDistributor distributor) external onlyOwner {
+    if (address(rewardDistributor) != address(0)) revert DistributorAlreadySet();
+    ...
+    rewardDistributor = distributor;
+}
+```
+
+The `_checkpoint` helper has no `try/catch` and no fallback:
+
+```solidity
+// StakingVault.sol:222-227
+function _checkpoint(address account) private {
+    IRewardDistributor distributor = rewardDistributor;
+    if (address(distributor) != address(0)) {
+        distributor.checkpoint(account);   // bare external call — revert propagates
+    }
+}
+```
+
+**Recommendation:** Wrap `distributor.checkpoint(account)` in a `try/catch` and emit a warning event on failure, or allow the owner to clear/replace the distributor address.
+
+---
+
+### FINDING 2 — HIGH: `deposit()` and `accrueYield()` inflate `totalAssets` before confirming receipt — fee-on-transfer tokens cause insolvency
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit()` (line 124), `accrueYield()` (line 183)
+
+**What an attacker can do:**  
+If the staking `asset` charges a transfer fee (i.e., the recipient receives `assets − fee_amount`), the vault credits `totalAssets += assets` in storage but only receives `assets − fee_amount` in tokens. Every deposit widens this gap. As shares are later redeemed against an inflated `totalAssets`, `completeWithdrawal()` will attempt to `safeTransfer` more tokens than the contract actually holds, causing withdrawals to revert for the last users out — a classic insolvency.
+
+```solidity
+// deposit() — state updated before transfer
+totalAssets += assets;       // line 132: records full amount
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+asset.safeTransferFrom(msg.sender, address(this), assets);  // line 136: may receive less
+
+// accrueYield() — same pattern
+totalAssets += assets;       // line 187
+asset.safeTransferFrom(msg.sender, address(this), assets);  // line 188
+```
+
+**Conditions required:**  
+The `asset` token deducts a fee on `transferFrom` (e.g., early-generation DeFi tokens, tokens with reflection mechanics). Standard ERC-20s with no fee are unaffected.
+
+**Recommendation:** If fee-on-transfer tokens are in scope, measure the actual balance delta: record `balanceAfter − balanceBefore` as `totalAssets` received rather than the nominal `assets` argument. If only standard tokens are supported, enforce this with a NatSpec `@notice` and optionally a balance-check assertion.
+
+---
+
+### FINDING 3 — MEDIUM: `deposit()` provides no minimum-shares guard, exposing depositors to share-price manipulation
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (line 124)
+
+**What an attacker can do:**  
+A user submits a `deposit(assets)` transaction expecting a certain number of shares based on the current exchange rate. If `accrueYield()` is included in the same block (or a preceding block in the mempool) by the owner, the exchange rate rises and the user receives materially fewer shares than anticipated, with no on-chain recourse.
+
+While `accrueYield` is owner-gated and this is therefore a trust concern rather than a permissionless exploit, it is also exploitable as a griefing vector under any multi-sig or time-lock setup where governance actions are publicly visible.
+
+**Conditions required:**  
+1. A user's `deposit()` transaction is in the mempool.  
+2. `accrueYield()` executes in the same or an earlier block, inflating `totalAssets`.
+
+**Recommendation:** Add a `minSharesOut` parameter and revert if `shares < minSharesOut`.
+
+---
+
+### FINDING 4 — MEDIUM: First-depositor share-inflation — no virtual shares or minimum initial deposit
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit()` (line 124), `convertToShares()` (line 107)
+
+**What an attacker can do:**  
+The vault uses the standard share-price formula with no virtual-shares offset:
+
+```solidity
+// line 109
+if (supply == 0) return assets;   // 1:1 on first deposit
+// line 110
+return assets.mulDiv(supply, totalAssets);
+```
+
+An adversarial first depositor can deposit 1 wei (receiving 1 share), after which the owner calls `accrueYield(N)` to inflate `totalAssets` to `N + 1`. Subsequent depositors who attempt to deposit fewer than `N + 1` assets receive 0 shares (`ZeroShares` revert protects them from losing tokens, but they cannot participate). A user who deposits exactly `N + 1` assets receives 1 share — the same as the attacker who deposited 1 wei. The attacker's share has been subsidised by `N` assets of owner-supplied yield; the second depositor's share is worth `(2N + 2) / 2 = N + 1`, which is fair. However, the rounding loss falls entirely on the second depositor: they effectively pay `N + 1` for a share worth `N + 1`, while the attacker paid 1 wei for the same.
+
+In concrete terms, for any configuration where `totalAssets / totalSupply` is very large (driven by yield accrual on a tiny initial deposit), users making small deposits lose rounding dust to existing holders.
+
+**Conditions required:**  
+The first depositor deposits a very small amount and the owner subsequently accrues yield before a second depositor arrives. Requires owner participation.
+
+**Recommendation:** Mint a small number of shares to `address(0)` on first deposit (virtual shares), or enforce a minimum initial deposit (e.g., 1e6 wei) to make the rounding loss negligible.
+
+---
+
+### FINDING 5 — LOW: `accrueYield()` does not checkpoint the reward distributor
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `accrueYield()` (line 183)
+
+**What an attacker can do:**  
+`accrueYield` increases `totalAssets` (and therefore each share's value) without calling `_checkpoint` for any account. If the `RewardDistributor` calculates per-account rewards as a function of share value (`balanceOf[account] × totalAssets / totalSupply`) rather than just raw share count, an account's un-checkpointed reward accrual since the last yield event will be calculated at the wrong (post-yield) exchange rate when the account next interacts. This allows a late depositor to capture rewards that should belong to existing holders.
+
+**Conditions required:**  
+The `rewardDistributor` implementation tracks rewards in units that depend on the vault's exchange rate (not purely in shares). The issue does not arise if rewards are purely share-count-weighted.
+
+**Recommendation:** Document the accounting assumption explicitly in the NatSpec of `accrueYield`, or emit an event that the distributor can use to trigger a global checkpoint.
+
+---
+
+### FINDING 6 — LOW: `setGuardian()` silently accepts `address(0)`, disabling the guardian role without reversion
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian()` (line 201)
+
+**What an attacker can do:**  
+The guardian is the secondary account allowed to call `pause()` in an emergency. `setGuardian` has no zero-address check:
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;   // address(0) accepted silently
+}
+```
+
+An owner who accidentally passes `address(0)` (e.g., a scripting error) eliminates the guardian's ability to pause deposits. Because `msg.sender` is never `address(0)` in practice, the `pause()` check `msg.sender != guardian` is always true when `guardian == address(0)`, meaning only the owner can pause. During a bridge between two guardians this creates an unintended window where emergency pause capability is degraded.
+
+**Conditions required:**  
+The owner passes `address(0)` to `setGuardian` (accidentally or via a botched multi-sig payload).
+
+**Recommendation:** Add `require(newGuardian != address(0), "GUARDIAN_ZERO")` or an equivalent custom error to make the intent explicit.
+
+---
+
+### FINDING 7 — INFORMATIONAL: Reentrancy lock uses `0`/`1` instead of the conventional `1`/`2`
+
+**File:** `src/core/StakingVault.sol`  
+**Lines:** 59, 78–81
+
+The guard is functionally correct. However, returning `_entered` to `0` after each call means the SSTORE from `1 → 0` receives an EIP-3529 gas refund, while the subsequent unlock-to-lock transition (`0 → 1`) costs a full cold write. The conventional pattern (`1` = unlocked, `2` = locked, never returning to zero) avoids the cold-write cost on every call after the first and makes the invariant easier to audit. No security impact in the current form.
+
+---
+
+### Summary Table
+
+| # | Severity | Contract | Function | Title |
+|---|---|---|---|---|
+| 1 | **High** | StakingVault | `requestWithdrawal`, `deposit` | Immutable distributor bricks withdrawals with no escape hatch |
+| 2 | **High** | StakingVault | `deposit`, `accrueYield` | Fee-on-transfer tokens inflate `totalAssets`, causing insolvency |
+| 3 | **Medium** | StakingVault | `deposit` | No minimum-shares guard; depositors exposed to rate manipulation |
+| 4 | **Medium** | StakingVault | `deposit`, `convertToShares` | No virtual shares; first-depositor inflation attack possible with owner |
+| 5 | **Low** | StakingVault | `accrueYield` | Yield accrual skips reward checkpoint; may break distributor accounting |
+| 6 | **Low** | StakingVault | `setGuardian` | Zero-address guardian silently disables emergency pause role |
+| 7 | **Info** | StakingVault | `nonReentrant` | Lock uses `0`/`1`; conventional `1`/`2` is cheaper and clearer |

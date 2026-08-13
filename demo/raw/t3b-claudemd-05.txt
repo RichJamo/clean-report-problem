@@ -1,0 +1,162 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            05
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:12:54Z
+# duration-ms:    370437
+# num-turns:      14
+# context-tokens: 120804
+# output-tokens:  21328
+# cost-usd:       0.4645831
+# is-error:       False
+# session-id:     094d8700-3bc3-4816-a7e0-20ea818c6fb0
+# ---- agent output below this line ----
+---
+
+## Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Supporting libraries reviewed:** `src/libraries/FixedPointMath.sol`, `src/libraries/SafeTransferLib.sol`, `src/auth/Ownable2Step.sol`  
+**Excluded per project instructions:** `src/rewards/`, `test/`, `src/interfaces/`
+
+---
+
+### FINDING 1 — HIGH: Irremovable reward distributor enables permanent DoS of deposits and withdrawal requests
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `setRewardDistributor` (line 194), `_checkpoint` (line 222), `deposit` (line 127), `requestWithdrawal` (line 149)
+
+**What an attacker can do:**  
+If the `rewardDistributor` can be made to revert on its `checkpoint` call — either because it contains a user-triggerable bug, or because it is set to a malicious contract — then every call to `deposit` and `requestWithdrawal` reverts permanently. Users who have not yet requested a withdrawal are trapped: they hold shares but cannot burn them. `completeWithdrawal` is unaffected (it does not call `_checkpoint`), so users who already opened a cooldown-period request can still exit, but all remaining stakers are frozen.
+
+**Conditions required:**  
+The write path is owner-controlled: `setRewardDistributor` is `onlyOwner` and can be called at most once (line 195 reverts on a second call). The permanent DoS therefore arises in two ways:
+
+1. **Buggy distributor** — the owner sets an honestly-intended distributor that contains a bug under which `checkpoint(account)` can be made to revert by a particular account balance or state condition. Any user that can engineer that condition blocks the entire deposit and request-withdrawal surfaces indefinitely.
+
+2. **Malicious distributor** — if the owner key is compromised, an adversary can set a distributor whose `checkpoint` reverts unconditionally, achieving the same effect.
+
+In both cases there is **no recovery path**: `setRewardDistributor` irrevocably binds the vault to the first distributor address set. There is no setter to replace it, no flag to bypass it, and no emergency mechanism. The `nonReentrant` guard correctly prevents re-entry, but it does nothing to contain a distributor that reverts.
+
+**Recommendation:**  
+Allow the owner to replace the distributor (removing the `DistributorAlreadySet` guard, or replacing it with governance delay), **or** wrap the external call in a try/catch so that a broken distributor degrades reward accounting rather than bricking the core deposit/withdrawal flow.
+
+---
+
+### FINDING 2 — MEDIUM: Fee recipient that reverts on ERC20 receipt bricks all non-zero-fee withdrawals
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal` (lines 172–175)
+
+```solidity
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);   // ← external call
+}
+asset.safeTransfer(msg.sender, paid);
+```
+
+**What an attacker can do:**  
+If `feeController.feeRecipient()` resolves to a contract whose token-receipt hook (ERC-777 `tokensReceived`, an overriding `fallback`, etc.) reverts, then `safeTransfer` propagates the revert and `completeWithdrawal` fails for **every** caller with a non-zero fee. All matured withdrawal requests are unclaimable.
+
+**Conditions required:**  
+- `withdrawalFeeBps > 0` (non-zero fee in force when the request was created), **and**
+- the current fee recipient rejects the token transfer.
+
+The fee recipient is set by the `FeeController` owner. Recovery is possible — the `FeeController` owner can call `setFeeRecipient` to a working address, or the `StakingVault` owner can call `FeeController.setWithdrawalFeeBps(0)` — but until that action is taken every outstanding fee-bearing request is frozen. If `FeeController` and `StakingVault` have different owners (permitted by the design), coordination may be delayed.
+
+**Recommendation:**  
+Send the fee via a pull-payment pattern (accrue to an internal balance, let the recipient claim separately), or wrap the fee transfer in a try/catch that falls back to holding the fee and allowing the user to collect their net amount regardless.
+
+---
+
+### FINDING 3 — LOW: `FixedPointMath.mulDiv` uses plain 256-bit multiplication and will revert on overflow
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv` (line 14)
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;
+}
+```
+
+Solidity 0.8.x reverts on unsigned-integer overflow. `x * y` overflows once the product exceeds `2^256 − 1`. This affects `convertToShares`, `convertToAssets`, and the fee calculation in `completeWithdrawal`.
+
+**What an attacker can do:**  
+Engineer a state in which `shares * totalAssets` (in `convertToAssets`) overflows — DoS-ing all withdrawal requests and their completion — or `assets * totalSupply` (in `convertToShares`) overflows, DoS-ing deposits.
+
+**Conditions required:**  
+For `convertToAssets`: `shares × totalAssets > 2^256`. With 18-decimal tokens and a 1 : 1 exchange rate this requires a supply of roughly `2^128 ≈ 3.4 × 10^20` tokens — far beyond any realistic total supply. With extreme yield accrual (`totalAssets ≫ totalSupply`) the threshold is lower but still requires the trusted owner to co-operate by calling `accrueYield` with astronomical amounts. In practice the overflow is not reachable without owner complicity, but the lack of 512-bit intermediate arithmetic is a latent defect that deviates from the ERC-4626 reference implementation.
+
+**Recommendation:**  
+Replace the naive multiply-then-divide with a 512-bit `mulDiv` (e.g., the algorithm from Remco Bloemen / OpenZeppelin `Math.mulDiv`) that avoids intermediate overflow entirely.
+
+---
+
+### FINDING 4 — LOW: `block.timestamp` used for cooldown enforcement; trivially bypassable for very short cooldowns
+
+**File:** `src/core/WithdrawalQueue.sol`  
+**Functions:** `enqueue` (line 75), `settle` (line 104)
+
+```solidity
+uint64 unlockAt = uint64(block.timestamp) + cooldown;   // enqueue
+if (block.timestamp < request.unlockAt) revert StillLocked(...);  // settle
+```
+
+Ethereum validators can shift `block.timestamp` by up to approximately 12 seconds from the previous block's timestamp without triggering consensus rejection. If `cooldown` is set to a value in that range (e.g., 1–12 seconds), a validator processing a settlement transaction can advance the timestamp enough to pass the `unlockAt` check before the intended duration has truly elapsed.
+
+**Conditions required:**  
+`cooldown` must be set to a very small value at deployment — the constructor has no lower-bound check. For operationally meaningful cooldowns (hours or days) the ~12-second manipulation is negligible.
+
+**Recommendation:**  
+Document a minimum safe cooldown (e.g., ≥ 1 hour) or add a constructor-time lower-bound check on `cooldown_`.
+
+---
+
+### FINDING 5 — INFORMATIONAL: `setGuardian` accepts `address(0)`, silently disabling the guardian role
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `setGuardian` (line 201)
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;
+}
+```
+
+Passing `address(0)` sets `guardian` to the zero address. The `pause()` check `msg.sender != owner && msg.sender != guardian` can never be satisfied by `address(0)` (since `msg.sender` is always a valid EOA or contract), so the guardian role is silently removed rather than causing an error. This is likely intentional (removing the guardian) but is undocumented and emits a `GuardianUpdated` event that may confuse off-chain monitoring.
+
+**Recommendation:**  
+Either explicitly allow and document `address(0)` as the sentinel for "no guardian", or add a custom error (`ZeroAddress`) matching the pattern used elsewhere in the codebase.
+
+---
+
+### FINDING 6 — INFORMATIONAL: No slippage protection in `deposit` or `requestWithdrawal`
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit` (line 124), `requestWithdrawal` (line 143)
+
+Neither function accepts a caller-specified minimum-output parameter (`minSharesOut` for deposits, `minAssetsOut` for withdrawals). The exchange rate can move between transaction submission and inclusion — for example if the owner calls `accrueYield` in the same block just before a user's deposit, the depositor receives fewer shares than anticipated; and if a large withdrawal request is processed before another user's request, the rate may shift.
+
+**Conditions required:**  
+Because yield accrual is owner-gated, the practical risk of sandwich attacks is low, but the design provides no on-chain guarantee to the user about the exchange rate they will receive.
+
+**Recommendation:**  
+Add optional `minOut` parameters that revert if the actual output falls short, consistent with ERC-4626's `deposit(assets, receiver)` / `withdraw` signatures.
+
+---
+
+### Summary table
+
+| # | Severity | Contract | Function(s) | Root Cause |
+|---|----------|----------|-------------|------------|
+| 1 | **High** | `StakingVault` | `setRewardDistributor`, `_checkpoint`, `deposit`, `requestWithdrawal` | Irrevocable distributor binding; no escape hatch if distributor reverts |
+| 2 | **Medium** | `StakingVault` | `completeWithdrawal` | Fee transfer failure bricks all pending fee-bearing withdrawals |
+| 3 | Low | `FixedPointMath` | `mulDiv` | 256-bit intermediate multiplication; overflow reverts for extreme inputs |
+| 4 | Low | `WithdrawalQueue` | `enqueue`, `settle` | `block.timestamp` manipulable; unsafe only for very short cooldowns |
+| 5 | Info | `StakingVault` | `setGuardian` | Zero-address accepted silently; no guard or documentation |
+| 6 | Info | `StakingVault` | `deposit`, `requestWithdrawal` | No minimum-output slippage protection |

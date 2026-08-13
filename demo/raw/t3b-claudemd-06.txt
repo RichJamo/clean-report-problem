@@ -1,0 +1,98 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            06
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:19:05Z
+# duration-ms:    415277
+# num-turns:      11
+# context-tokens: 88442
+# output-tokens:  23858
+# cost-usd:       0.5018075
+# is-error:       False
+# session-id:     c3f73b85-da04-4b16-8ad9-8ea3c20ec76a
+# ---- agent output below this line ----
+I now have a complete picture of the codebase. Here is the audit report.
+
+---
+
+# Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Compiler:** Solidity 0.8.24
+
+---
+
+## [H-1] Permanent DoS on deposits and new withdrawal requests if `rewardDistributor` becomes non-functional
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit()` (L124), `requestWithdrawal()` (L143), via `_checkpoint()` (L222)
+
+**What an attacker can do:**  
+If the `rewardDistributor`'s `checkpoint()` function reverts for any reason, every call to `deposit()` and `requestWithdrawal()` will permanently revert. Stakers holding shares cannot initiate new withdrawal requests, trapping their principal indefinitely. `completeWithdrawal()` is the only write path that does not call `_checkpoint`, so only pre-queued requests can be completed—shares with no corresponding queue entry are permanently locked.
+
+**Conditions required:**  
+`setRewardDistributor` must have been called (once set, the value is immutable). The distributor then needs to make `checkpoint()` revert—whether due to a bug, an administrative pause, a failed upgrade, or a griefing attack. There is no owner-callable escape hatch: `DistributorAlreadySet` prevents re-pointing the distributor, and `_checkpoint()` has no try/catch.
+
+**Root cause:**  
+`setRewardDistributor` enforces a write-once invariant without providing any recovery path. An unconditional external call inside a mandatory code path (`_checkpoint`) with no error handling means a broken distributor is a permanent brick.
+
+---
+
+## [M-1] Check-Effects-Interactions violation in `deposit()`
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `deposit()` (L132–136)
+
+**What an attacker can do:**  
+`totalAssets`, `totalSupply`, and `balanceOf[msg.sender]` are all incremented before `safeTransferFrom` is called. During the `safeTransferFrom` call, any transfer hook on the asset token (e.g., ERC-777 `tokensToSend`) fires while the vault's accounting shows the deposit as complete but the tokens have not yet arrived. The reentrancy guard prevents direct re-entry into the vault, but the hook can freely call external contracts—such as a lending protocol using vault share balances as collateral, or any oracle reading `balanceOf` or `totalAssets`—that will observe a balance that does not reflect actual custody.
+
+**Conditions required:**  
+The staked asset must implement transfer hooks (e.g., ERC-777). A depositor (or a contract the depositor calls from the hook) must interact with a system that reads vault state during the hook's execution window.
+
+**Root cause:**  
+State mutation precedes the interaction. The canonical mitigation is to perform the `safeTransferFrom` first and derive `shares` from the actual change in balance, or at minimum move the interaction to before the effects. The `nonReentrant` guard narrows but does not eliminate the window.
+
+---
+
+## [L-1] Fee recipient is resolved dynamically at settlement, not frozen at request time
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (L173)
+
+**What an attacker can do:**  
+The fee *rate* (`feeBps`) is correctly frozen in `WithdrawalQueue` at the moment `requestWithdrawal` is called. However, the fee *destination* is read live from `feeController.feeRecipient()` at the moment `completeWithdrawal` is called. An owner (or a compromised owner key) can call `FeeController.setFeeRecipient()` between a user's `requestWithdrawal` and `completeWithdrawal` transactions, redirecting the fee portion of every pending withdrawal to an arbitrary address. Since the cooldown period can be substantial, many requests may be queued when the switch happens.
+
+**Conditions required:**  
+Owner (or attacker with owner credentials) must call `setFeeRecipient` while withdrawal requests are queued and before they are settled.
+
+**Root cause:**  
+The code comment at line 157 ("The fee in force now is held for this request") describes the fee rate but the same protection was not applied to the recipient address.
+
+---
+
+## [L-2] `FixedPointMath.mulDiv` can overflow on the intermediate product, causing DoS
+
+**File:** `src/libraries/FixedPointMath.sol` (used by `StakingVault.sol` throughout)  
+**Affected calls:** `convertToShares()`, `convertToAssets()`, fee computation in `completeWithdrawal()`
+
+**What an attacker can do:**  
+`mulDiv` computes `(x * y) / d` using a plain Solidity multiplication. If `x * y` exceeds `type(uint256).max`, the 0.8.x checked arithmetic reverts. In `convertToShares`, `x = assets` and `y = totalSupply`; in `convertToAssets`, `x = shares` and `y = totalAssets`. If either product reaches ~2²⁵⁶, `deposit()` or `requestWithdrawal()` reverts for all callers regardless of how small an individual deposit is—because `totalSupply` or `totalAssets` alone can push the intermediate product over the limit.
+
+**Conditions required:**  
+`totalSupply` or `totalAssets` must grow large enough that multiplying by a caller-supplied amount overflows. The overflow threshold is approximately `2²⁵⁶ / max_deposited_amount`. With a high-precision 18-decimal token this can be reached with `~2⁵⁶` units of total supply and a deposit of `2^200` assets, which is impractical today but becomes more reachable under inflationary yield scenarios or with low-decimal tokens where the ratio of supply to assets differs greatly.
+
+**Root cause:**  
+The library does not use a 512-bit multiply-then-divide (as in Solady's or OpenZeppelin's `Math.mulDiv`). The vulnerability is latent rather than immediately exploitable but is an unnecessary constraint that standard libraries already solve.
+
+---
+
+## Informational
+
+**`accrueYield` uses `require` with a string literal** (`StakingVault.sol:185`) while every other error path uses custom errors. This is a style inconsistency the style guide explicitly prohibits and wastes gas relative to a custom error.
+
+**`nonReentrant` uses `0`/`1` sentinels** (`StakingVault.sol:59, 77–82`) rather than the canonical `1`/`2` pattern. Resetting to zero after each call means the next call always incurs a cold-write SSTORE (20,000 gas) to go `0 → 1`, roughly 7× more expensive than the `1 → 2` warm write. This is a gas inefficiency, not a security bug, but each guarded call to `deposit`, `requestWithdrawal`, and `completeWithdrawal` pays the penalty.
+
+**`WithdrawalQueue.enqueue` does not bound `unlockAt` against overflow** (`WithdrawalQueue.sol:75`): `uint64(block.timestamp) + cooldown` will wrap silently if `cooldown` is set close to `type(uint64).max`. The vault constructor passes `cooldown_` with no upper-bound check, meaning an owner supplying a pathological cooldown could make `unlockAt` underflow to a past timestamp and eliminate the cooldown entirely. This is within the owner trust model but is a footgun absent in a well-guarded constructor.

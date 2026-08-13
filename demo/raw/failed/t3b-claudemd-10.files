@@ -1,0 +1,8 @@
+CLAUDE.md
+src/core/StakingVault.sol
+src/core/FeeController.sol
+src/core/WithdrawalQueue.sol
+src/auth/Ownable2Step.sol
+src/libraries/SafeTransferLib.sol
+src/libraries/FixedPointMath.sol
+src/interfaces/IRewardDistributor.sol

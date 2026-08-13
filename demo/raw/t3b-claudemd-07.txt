@@ -1,0 +1,136 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            07
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:26:01Z
+# duration-ms:    388827
+# num-turns:      9
+# context-tokens: 50497
+# output-tokens:  22519
+# cost-usd:       0.39671519999999993
+# is-error:       False
+# session-id:     a927e727-7932-4135-bef4-4aa09325c44c
+# ---- agent output below this line ----
+I've read all three in-scope contracts (`StakingVault`, `FeeController`, `WithdrawalQueue`) plus their imported libraries and the auth module. Here is the audit report.
+
+---
+
+## Security Audit — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`  
+**Compiler:** Solidity 0.8.24  
+**Date:** 2026-08-12
+
+---
+
+### M-1 — Owner can front-run `requestWithdrawal` with a fee increase
+
+**File / function:** `src/core/StakingVault.sol:requestWithdrawal` (line 159), `src/core/FeeController.sol:setWithdrawalFeeBps` (line 44)
+
+**What an attacker can do:** The withdrawal fee rate is snapshotted at the moment `requestWithdrawal` executes:
+
+```solidity
+id = withdrawalQueue.enqueue(msg.sender, assets, feeController.withdrawalFeeBps());
+```
+
+`setWithdrawalFeeBps` is not timelocked. An owner (or a compromised owner key) can raise the rate to the 5 % ceiling by submitting `setWithdrawalFeeBps(500)` with higher gas than a user's pending `requestWithdrawal`. The user's request then settles at the elevated rate, and the owner can lower it again afterward. The user has no recourse; they either accept the 5 % haircut or leave capital in cooldown.
+
+**Conditions required:** Owner acts adversarially or the owner key is compromised. No timelock or commit-delay is present on fee changes.
+
+**Recommendation:** Enforce a time-delay (e.g., a two-step change with a minimum waiting period) between `setWithdrawalFeeBps` being called and taking effect.
+
+---
+
+### L-1 — Zero cooldown is deployable; two-phase exit can be bypassed atomically
+
+**File / function:** `src/core/StakingVault.sol` constructor (line 101), `src/core/WithdrawalQueue.sol:enqueue` (line 75) / `settle` (line 104)
+
+**What an attacker can do:** `cooldown_` is passed to `WithdrawalQueue` without validation. When `cooldown_ = 0`:
+
+```solidity
+uint64 unlockAt = uint64(block.timestamp) + cooldown; // == block.timestamp
+```
+
+`settle` then checks `block.timestamp < request.unlockAt`, which is `block.timestamp < block.timestamp` — always false — so the request is immediately settleable. A contract can call `requestWithdrawal` and `completeWithdrawal` in the same transaction, collapsing the two-phase exit into a single atomic step. This defeats any slashing window, oracle update latency, or liquidity management that the cooldown is meant to protect.
+
+**Conditions required:** Vault deployed with `cooldown_ = 0`. No on-chain guard prevents this.
+
+**Recommendation:** Add `require(cooldown_ > 0, "COOLDOWN_ZERO")` in the `WithdrawalQueue` constructor, or enforce a protocol-specific minimum.
+
+---
+
+### L-2 — `setGuardian` accepts `address(0)` without a distinct acknowledgement
+
+**File / function:** `src/core/StakingVault.sol:setGuardian` (line 201)
+
+**What an attacker can do:** Passing `address(0)` silently removes the guardian's ability to call `pause()`. A typo (`setGuardian(0x000...0)` instead of the intended address) silently degrades emergency response — `pause()` becomes owner-only — with no revert or distinct error to catch the mistake. An attacker who can induce the owner to call `setGuardian(address(0))` (social engineering, supply-chain, etc.) eliminates the guardian safeguard before an exploit.
+
+**Conditions required:** Owner calls `setGuardian(address(0))`, intentionally or by mistake.
+
+**Recommendation:** Require a non-zero address, or emit a clearly differentiated event (e.g., `GuardianRemoved`) when the caller deliberately passes zero, so monitoring can distinguish intent from error.
+
+---
+
+### L-3 — `FixedPointMath.mulDiv` uses a naive intermediate product that overflows for large values
+
+**File / function:** `src/libraries/FixedPointMath.sol:mulDiv` (line 14), called in `src/core/StakingVault.sol:convertToShares` (line 110), `convertToAssets` (line 117), `completeWithdrawal` (line 169)
+
+**What an attacker can do:** The implementation is:
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;
+}
+```
+
+Solidity 0.8.x checks `x * y` for overflow and reverts. If both `totalSupply` and a deposit amount are large enough that their product exceeds `type(uint256).max`, every call to `convertToShares` reverts, permanently blocking deposits and withdrawals (a denial-of-service). The same applies to `convertToAssets` with `totalAssets`.
+
+The overflow threshold is high (both operands near 10^38 simultaneously), making exploitation implausible for tokens with 18 decimals and typical supply caps. However, there is no formal bound in the code preventing it, and a properly reviewed vault library should not rely on practical implausibility as its safety margin.
+
+**Conditions required:** `totalSupply × deposit_amount > 2^256 − 1`. Remote but unbounded.
+
+**Recommendation:** Replace with a 512-bit mulDiv (e.g., the implementation from OpenZeppelin's `Math.mulDiv`) so intermediate overflow is structurally impossible.
+
+---
+
+### I-1 — Reentrancy guard uses the 0 / 1 storage pattern instead of 1 / 2
+
+**File / function:** `src/core/StakingVault.sol:nonReentrant` (line 77)
+
+The guard stores `0` for "not entered" and `1` for "entered". Resetting from `1 → 0` at exit clears the storage slot, costing a cold SSTORE (20,000 gas) on the first call of each transaction. OpenZeppelin's standard uses `1` and `2` (non-zero in both states), keeping the slot warm and reducing the per-call overhead to ~5,800 gas.
+
+There is no security flaw; the guard functions correctly.
+
+**Recommendation:** Initialize `_entered = 1` (e.g., in the constructor) and toggle between `1` and `2`.
+
+---
+
+### I-2 — `require` string literals used in `accrueYield` and the constructor
+
+**File / function:** `src/core/StakingVault.sol:accrueYield` (line 185), constructor (lines 96–97)
+
+```solidity
+require(totalSupply != 0, "NO_SUPPLY");
+require(address(asset_) != address(0), "ASSET_ZERO");
+require(address(feeController_) != address(0), "FEES_ZERO");
+```
+
+The project style guide requires custom errors for all new code. These three sites are inconsistent with the rest of the file and with `FeeController`, which uses custom errors throughout.
+
+**Recommendation:** Replace with `if (...) revert CustomError()` declarations consistent with the rest of the codebase.
+
+---
+
+### Summary table
+
+| ID | Severity | File | Title |
+|----|----------|------|-------|
+| M-1 | Medium | `StakingVault`, `FeeController` | Owner fee front-run on `requestWithdrawal` |
+| L-1 | Low | `StakingVault`, `WithdrawalQueue` | Zero cooldown bypasses two-phase exit |
+| L-2 | Low | `StakingVault` | `setGuardian(address(0))` silently removes guardian |
+| L-3 | Low | `FixedPointMath` / `StakingVault` | Naive `mulDiv` overflows for extreme values (DoS) |
+| I-1 | Info | `StakingVault` | Reentrancy guard uses expensive 0/1 slot pattern |
+| I-2 | Info | `StakingVault` | `require` strings violate custom-error style convention |

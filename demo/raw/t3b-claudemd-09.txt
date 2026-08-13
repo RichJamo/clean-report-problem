@@ -1,0 +1,206 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            09
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:39:15Z
+# duration-ms:    313794
+# num-turns:      11
+# context-tokens: 66718
+# output-tokens:  17710
+# cost-usd:       0.33061874999999996
+# is-error:       False
+# session-id:     af0257ba-ce68-4fa8-b7cf-51974f789dc5
+# ---- agent output below this line ----
+I have a complete picture of the codebase. Let me compile the report now.
+
+---
+
+## Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`, plus their direct dependencies (`src/auth/Ownable2Step.sol`, `src/libraries/`).
+**Date:** 2026-08-12
+
+---
+
+### Finding 1 — HIGH: Permanent vault DoS if `rewardDistributor` reverts
+
+**File:** `src/core/StakingVault.sol`
+**Functions:** `_checkpoint`, `setRewardDistributor`
+
+**What an attacker (or a bug) can do:**
+Make it impossible for any user to deposit or initiate a withdrawal — permanently — with no recovery path.
+
+**How it works:**
+`_checkpoint` is called inside both `deposit` (line 127) and `requestWithdrawal` (line 149) before any state changes:
+
+```solidity
+function _checkpoint(address account) private {
+    IRewardDistributor distributor = rewardDistributor;
+    if (address(distributor) != address(0)) {
+        distributor.checkpoint(account);   // unchecked external call
+    }
+}
+```
+
+If this external call reverts — because the distributor contract has a bug, is self-destructed, or is upgraded to a malicious implementation — every call to `deposit` and `requestWithdrawal` reverts with it. Users holding shares cannot even begin the exit process.
+
+The distributor is set exactly once and **cannot be changed or removed**:
+
+```solidity
+function setRewardDistributor(IRewardDistributor distributor) external onlyOwner {
+    if (address(rewardDistributor) != address(0)) revert DistributorAlreadySet();
+    ...
+}
+```
+
+There is no emergency escape: no way to null out the distributor, no way to bypass `_checkpoint`, no `completeWithdrawal` path for users who have already requested a withdrawal (since `completeWithdrawal` does not call `_checkpoint` — only existing request holders could still exit through that path).
+
+**Conditions required:**
+- Owner calls `setRewardDistributor` (a one-time action).
+- The distributor's `checkpoint` function subsequently becomes reverting (bug, malicious upgrade, or deliberate attack on the distributor contract).
+
+**Recommendation:** Allow the owner to unset or replace the distributor, or wrap the `_checkpoint` call in a try/catch so a broken distributor degrades gracefully rather than bricking the vault.
+
+---
+
+### Finding 2 — MEDIUM: Pending withdrawals permanently stuck if `feeRecipient` is set to a reverting address
+
+**File:** `src/core/StakingVault.sol`
+**Function:** `completeWithdrawal`
+
+**What an attacker can do:**
+A malicious or compromised owner can set `feeRecipient` to a contract that reverts on token receipt, causing every in-flight withdrawal with a non-zero fee to revert indefinitely. There is no cancel mechanism.
+
+**How it works:**
+`requestWithdrawal` correctly locks the `feeBps` at the moment of the request (stored in `WithdrawalQueue`), so later fee changes cannot retroactively affect exits. However, the recipient of that fee is read **live from `FeeController` at completion time**:
+
+```solidity
+// completeWithdrawal, line 169-174
+uint256 fee = assets.mulDiv(feeBps, feeController.BPS_DENOMINATOR());
+paid = assets - fee;
+
+if (fee != 0) {
+    asset.safeTransfer(feeController.feeRecipient(), fee);   // live read
+}
+asset.safeTransfer(msg.sender, paid);
+```
+
+If `feeRecipient` is changed to a contract whose fallback reverts (or a token-reject hook reverts the ERC-20 `transfer`), the `safeTransfer` will revert. The queue entry is never marked `settled`, so the user cannot retry after the lock is fixed without replaying the same failing path first — but since `settle` sets `settled = true` only on success and does so inside the vault's `completeWithdrawal`, a reverting `safeTransfer` leaves the entry permanently unresolved until the owner corrects `feeRecipient`.
+
+No mechanism exists for a user to cancel a queued withdrawal and reclaim their shares; shares were burned at `requestWithdrawal` time (line 153-154).
+
+**Conditions required:**
+- At least one pending withdrawal request with `feeBps > 0`.
+- Owner (or a compromised `FeeController` owner — note `FeeController` has its own separate `Ownable2Step`) changes `feeRecipient` to a reverting address.
+
+**Recommendation:** Either snapshot `feeRecipient` into the queue entry at request time (alongside `feeBps`), or add a withdrawal-cancel path that re-mints shares.
+
+---
+
+### Finding 3 — MEDIUM: CEI violated in `deposit` and `requestWithdrawal` — external call before effects
+
+**File:** `src/core/StakingVault.sol`
+**Functions:** `deposit`, `requestWithdrawal`
+
+**What an attacker can do:**
+If the `rewardDistributor` is a contract that also holds the `guardian` role (or if the vault owner inadvertently grants the distributor guardian status), a malicious distributor can call `pause()` mid-execution during the `_checkpoint` external call, permanently disabling future deposits without the in-progress transaction failing.
+
+**How it works:**
+Both functions call `_checkpoint` — an external call — before performing any state changes:
+
+```solidity
+// deposit, line 127-134
+_checkpoint(msg.sender);          // external call — effects not yet applied
+
+shares = convertToShares(assets);
+...
+totalAssets += assets;            // effects come later
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+
+asset.safeTransferFrom(...);      // interaction last
+```
+
+The `nonReentrant` guard blocks reentry into any other `nonReentrant` function. However, it does **not** guard `pause()`, `unpause()`, or `setGuardian()`. A distributor that is also the guardian can call `pause()` during `_checkpoint`. The in-progress `deposit` succeeds (because `whenNotPaused` was already evaluated at function entry), but the vault is left in the paused state for all future callers.
+
+**Conditions required:**
+- `rewardDistributor` address is also the `guardian` (misconfiguration).
+- Distributor's `checkpoint` implementation contains a callback that calls `pause()`.
+
+**Recommendation:** Move `_checkpoint` to after all storage writes (but before the external token transfer, which is already last). This would make the code fully CEI-compliant and eliminate the window entirely.
+
+---
+
+### Finding 4 — LOW: `mulDiv` uses naive multiplication — reverts on overflow for large values
+
+**File:** `src/libraries/FixedPointMath.sol`
+**Function:** `mulDiv`
+
+**What an attacker can do:**
+Cause legitimate deposits or asset conversions to revert by pushing `totalAssets` and `totalSupply` to values where `x * y` exceeds `type(uint256).max`, triggering Solidity 0.8's checked arithmetic.
+
+**How it works:**
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // no 512-bit intermediate
+}
+```
+
+`convertToAssets` computes `shares * totalAssets / totalSupply`. If `totalAssets` is sufficiently large relative to `totalSupply` (possible after repeated `accrueYield` calls) and `shares` is large, the product overflows. For standard 18-decimal tokens this requires extreme values (totalAssets > ~10^59), making it theoretical rather than practical, but the absence of a full-precision mulDiv is a latent correctness risk.
+
+**Recommendation:** Replace `mulDiv` with a 512-bit implementation (e.g., the Solady or OpenZeppelin approach using the mulmod trick) to guarantee correctness for all input values.
+
+---
+
+### Finding 5 — LOW: No minimum cooldown enforced — zero cooldown eliminates sandwich protection
+
+**File:** `src/core/WithdrawalQueue.sol` (constructor), `src/core/StakingVault.sol` (constructor)
+
+**What an attacker can do:**
+If deployed with `cooldown_ = 0`, an attacker can sandwich every `accrueYield` call — deposit immediately before it and withdraw in the same block — extracting yield contributed by existing stakers with no capital lock-up.
+
+**How it works:**
+`WithdrawalQueue` computes `unlockAt = uint64(block.timestamp) + cooldown` (line 75). With `cooldown = 0`, `unlockAt == block.timestamp`, so `settle` succeeds immediately. An attacker seeing a pending `accrueYield` transaction can atomically:
+1. Call `deposit` to obtain shares at the pre-yield price.
+2. Wait for `accrueYield` to execute.
+3. Call `requestWithdrawal` + `completeWithdrawal` in the same or next block.
+
+The entire attack requires no holding period.
+
+**Conditions required:**
+- Deployer passes `cooldown_ = 0` to the constructor.
+
+**Recommendation:** Enforce a minimum cooldown in the constructor (e.g., `require(cooldown_ >= MIN_COOLDOWN, "COOLDOWN_TOO_SHORT")`).
+
+---
+
+### Finding 6 — INFORMATIONAL: Fee-on-transfer tokens would cause `totalAssets` to overstate actual balance
+
+**File:** `src/core/StakingVault.sol`
+**Functions:** `deposit`, `accrueYield`
+
+Both functions credit `totalAssets` with the stated `assets` parameter before executing `safeTransferFrom`. If the underlying `asset` is a fee-on-transfer token, the vault receives fewer tokens than it records, making `totalAssets` persistently overstated. Every subsequent withdrawal would drain slightly more tokens than the vault holds until it becomes insolvent.
+
+The vault documentation does not exclude such tokens, and no balance-diff check exists post-transfer.
+
+**Conditions required:**
+- Vault is deployed with a fee-on-transfer ERC-20 as `asset`.
+
+**Recommendation:** Document that fee-on-transfer tokens are not supported, or add a post-transfer balance check and credit only the actual delta received.
+
+---
+
+### Summary
+
+| # | Severity | Location | Title |
+|---|----------|----------|-------|
+| 1 | HIGH | `StakingVault._checkpoint` / `setRewardDistributor` | Permanent vault DoS if distributor reverts |
+| 2 | MEDIUM | `StakingVault.completeWithdrawal` | Stuck withdrawals when `feeRecipient` reverts |
+| 3 | MEDIUM | `StakingVault.deposit` / `requestWithdrawal` | CEI violation — external call before effects |
+| 4 | LOW | `FixedPointMath.mulDiv` | Naive multiplication overflows for extreme values |
+| 5 | LOW | `WithdrawalQueue` constructor | Zero cooldown permitted, enabling MEV sandwiching |
+| 6 | INFO | `StakingVault.deposit` / `accrueYield` | Fee-on-transfer tokens overstate `totalAssets` |

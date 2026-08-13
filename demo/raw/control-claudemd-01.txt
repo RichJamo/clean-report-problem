@@ -1,0 +1,194 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            01
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T15:54:30Z
+# duration-ms:    280007
+# num-turns:      15
+# context-tokens: 97097
+# output-tokens:  16140
+# cost-usd:       0.34130115
+# is-error:       False
+# session-id:     7694022a-8aac-4096-9323-1f17763e6bde
+# ---- agent output below this line ----
+Now I have a complete picture of the codebase. Let me compile the findings.
+
+---
+
+## Security Audit Report
+
+**Project:** StakingVault + RewardDistributor  
+**Files audited:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/FixedPointMath.sol`, `src/libraries/SafeTransferLib.sol`
+
+---
+
+### CRITICAL-1 — Reward double-spend via un-zeroed `accrued` mapping
+
+**File:** `src/rewards/RewardDistributor.sol`  
+**Function:** `claim()` (line 119)
+
+**What an attacker can do:** Drain the entire reward token balance of the `RewardDistributor` by calling `claim()` repeatedly. Each call pays out the same `accrued[msg.sender]` balance without ever clearing it.
+
+**Conditions required:**
+1. The attacker stakes tokens in the vault.
+2. `notifyReward()` is called at least once while they are staked.
+3. The attacker triggers any vault action that calls `_checkpoint` on their account — a second `deposit` or a `requestWithdrawal`. The `checkpoint` function folds the pending rewards into `accrued[account]` and resets `userIndex[account]` to `globalIndex`.
+4. The attacker then calls `claim()` in a loop.
+
+**Root cause:** `claim()` computes the payout as `accrued[msg.sender] + _pendingFor(msg.sender)`, updates `userIndex[msg.sender]` (zeroing the pending portion), transfers the tokens — but **never executes `accrued[msg.sender] = 0`**. After the first call, `_pendingFor` returns 0 (userIndex == globalIndex), but `accrued[msg.sender]` retains its full pre-claim value and is paid out again on every subsequent call.
+
+```solidity
+// RewardDistributor.sol:119-129
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);   // pays out
+    // ← accrued[msg.sender] is never cleared; next call pays it again
+    emit Claimed(msg.sender, amount);
+}
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` immediately after computing `amount` (or before the transfer).
+
+---
+
+### HIGH-1 — Permanent vault DoS via irrevocable malicious reward distributor
+
+**File:** `src/core/StakingVault.sol`  
+**Functions:** `deposit()` (line 124), `requestWithdrawal()` (line 143), `setRewardDistributor()` (line 194)
+
+**What an attacker can do:** If the owner sets a distributor that reverts (or runs out of gas) inside `checkpoint`, all calls to `deposit()` and `requestWithdrawal()` are permanently bricked. There is no mechanism to replace or remove the distributor once set.
+
+**Conditions required:**
+- `setRewardDistributor` is callable exactly once by the owner (enforced by `DistributorAlreadySet`). If the address provided is a contract that reverts in `checkpoint` — whether due to a bug, a later self-destruct, or deliberate malice — the vault cannot recover.
+- An attacker who gains momentary owner access (or social-engineers the deployment step) can set a trap address and then relinquish control.
+
+**Root cause:** `setRewardDistributor` explicitly enforces that it is called at most once (`if (address(rewardDistributor) != address(0)) revert DistributorAlreadySet()`). The `_checkpoint` call in both critical user paths has no try/catch and the distributor cannot be changed afterward.
+
+```solidity
+// StakingVault.sol:222-227
+function _checkpoint(address account) private {
+    IRewardDistributor distributor = rewardDistributor;
+    if (address(distributor) != address(0)) {
+        distributor.checkpoint(account);   // no error handling; failure = total DoS
+    }
+}
+```
+
+**Fix:** Either wrap the external call in a try/catch so a failing distributor degrades gracefully rather than bricking the vault, or allow the owner to replace the distributor (with appropriate access controls and checkpointing of existing balances).
+
+---
+
+### MEDIUM-1 — Shares burned with zero assets returned under extreme price conditions
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `requestWithdrawal()` (line 143)
+
+**What an attacker can do:** Under conditions where the share price is extremely high (many rounds of `accrueYield` with no new depositors), `convertToAssets(shares)` can round down to zero for small share amounts. The shares are permanently burned while the withdrawal request is for zero assets — the user irrecoverably loses value.
+
+**Conditions required:**
+- `totalAssets` is very large relative to `totalSupply` (e.g., achieved by owner calling `accrueYield` many times with no new deposits).
+- A user calls `requestWithdrawal` with a small enough `shares` value that `shares * totalAssets / totalSupply < 1`.
+
+**Root cause:** `requestWithdrawal` deducts `shares` from `balanceOf` and `totalSupply`, deducts `assets` from `totalAssets`, and enqueues the request — but there is no guard that `assets > 0`:
+
+```solidity
+// StakingVault.sol:151-159
+uint256 assets = convertToAssets(shares);  // can return 0 due to rounding
+balanceOf[msg.sender] = held - shares;     // shares burned regardless
+totalSupply -= shares;
+totalAssets -= assets;                     // no-op if assets == 0
+id = withdrawalQueue.enqueue(msg.sender, assets, feeController.withdrawalFeeBps());
+```
+
+**Fix:** Add `if (assets == 0) revert ZeroAmount();` after computing `assets` in `requestWithdrawal`.
+
+---
+
+### MEDIUM-2 — `FixedPointMath.mulDiv` intermediate overflow reverts on large inputs
+
+**File:** `src/libraries/FixedPointMath.sol`  
+**Function:** `mulDiv()` (line 14)
+
+**What an attacker can do:** Cause a permanent revert on `notifyReward`, `deposit`, `requestWithdrawal`, or `completeWithdrawal` by engineering a state where the intermediate product `x * y` exceeds `type(uint256).max`, making the affected function permanently uncallable.
+
+**Conditions required:**
+- In `notifyReward`: `amount * WAD` overflows — requires `amount > ~1.16 × 10^59` tokens (impractical).
+- In `_pendingFor`: `vault.balanceOf(account) * (globalIndex - userIndex[account])` overflows — feasible if `globalIndex` is driven very high by repeated `notifyReward` calls against a tiny supply (supply = 1 wei), and a large holder then tries to claim. This would also block the vault's `_checkpoint` call and therefore `deposit`/`requestWithdrawal` for that account permanently.
+- In `convertToShares`/`convertToAssets`: large `assets * totalSupply` product.
+
+**Root cause:** The library uses `(x * y) / d` with Solidity 0.8.x checked arithmetic. There is no 512-bit intermediate or `mulmod`-based implementation.
+
+```solidity
+// FixedPointMath.sol:14
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // reverts if x * y > type(uint256).max
+}
+```
+
+**Fix:** Replace with a full-precision `mulDiv` (e.g., Solidity's built-in `Math.mulDiv` or an assembly implementation using `mulmod`) that handles intermediate products up to 512 bits.
+
+---
+
+### LOW-1 — `WithdrawalCompleted` event emits net payout in the `assets` field
+
+**File:** `src/core/StakingVault.sol`  
+**Function:** `completeWithdrawal()` (line 166)
+
+**What an attacker can do:** Off-chain indexers, subgraphs, and accounting tools that rely on the `WithdrawalCompleted` event to track gross assets leaving the vault will record understated figures; the discrepancy grows with the fee rate. No on-chain safety impact, but it undermines auditability.
+
+**Conditions required:** Any withdrawal where `feeBps > 0`.
+
+**Root cause:** The event is defined as `event WithdrawalCompleted(address, uint256 id, uint256 assets, uint256 fee)`, but the value emitted in the `assets` position is `paid` (already net of the fee):
+
+```solidity
+// StakingVault.sol:175-177
+emit WithdrawalCompleted(msg.sender, id, paid, fee);
+//                                       ^^^^
+//                                  "paid" = assets - fee, not gross assets
+```
+
+**Fix:** Retain `assets` from the `settle()` return value and emit it: `emit WithdrawalCompleted(msg.sender, id, assets, fee);`.
+
+---
+
+### LOW-2 — `Ownable2Step.transferOwnership` accepts `address(0)` as nominee
+
+**File:** `src/auth/Ownable2Step.sol`  
+**Function:** `transferOwnership()` (line 30)
+
+**What an attacker can do:** An owner can silently wipe `pendingOwner` by calling `transferOwnership(address(0))`. The emitted `OwnershipTransferStarted` event announces a handover to the zero address, which is misleading, and `acceptOwnership` can never be called by `address(0)` — so the in-progress transfer is silently cancelled with no cancellation event.
+
+**Conditions required:** Owner calls `transferOwnership(address(0))`, intentionally or by accident.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` in `transferOwnership`, or introduce an explicit `cancelOwnershipTransfer()` function.
+
+---
+
+### Informational — `SafeTransferLib` does not verify target contract existence
+
+**File:** `src/libraries/SafeTransferLib.sol`  
+**Functions:** `safeTransfer()`, `safeTransferFrom()` (lines 14, 20)
+
+A low-level `.call()` to an address with no deployed code returns `(true, "")`. `_succeeded` treats this as success. If either `asset` or `rewardToken` were ever self-destructed (or if an address is provided that never had code), transfers would silently appear to succeed. Given that both token addresses are immutable and set in constructors this is a low residual risk, but the library has no defense in depth against this class of failure.
+
+---
+
+### Summary Table
+
+| ID | Severity | File | Function | Impact |
+|----|----------|------|----------|--------|
+| CRITICAL-1 | Critical | `RewardDistributor.sol` | `claim()` | Full reward pool drained by any checkpointed staker |
+| HIGH-1 | High | `StakingVault.sol` | `setRewardDistributor()` / `_checkpoint()` | Permanent vault DoS if distributor is malicious or buggy |
+| MEDIUM-1 | Medium | `StakingVault.sol` | `requestWithdrawal()` | Shares burned with zero payout under extreme share price |
+| MEDIUM-2 | Medium | `FixedPointMath.sol` | `mulDiv()` | DoS via overflow on large inputs |
+| LOW-1 | Low | `StakingVault.sol` | `completeWithdrawal()` | Misleading event data for off-chain consumers |
+| LOW-2 | Low | `Ownable2Step.sol` | `transferOwnership()` | Silent cancellation of pending transfer via `address(0)` |
+| INFO | Info | `SafeTransferLib.sol` | `safeTransfer/From()` | No contract-existence check |

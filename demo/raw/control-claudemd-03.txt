@@ -1,0 +1,132 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            03
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:03:42Z
+# duration-ms:    262582
+# num-turns:      16
+# context-tokens: 110871
+# output-tokens:  15192
+# cost-usd:       0.37182675
+# is-error:       False
+# session-id:     7949414c-5c1f-48d7-a70f-461100166280
+# ---- agent output below this line ----
+---
+
+## Security Audit Report
+
+**Codebase:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `FixedPointMath`, `SafeTransferLib`
+**Date:** 2026-08-12
+
+---
+
+### CRITICAL — `RewardDistributor.sol::claim()` — Unbounded re-claim drains all reward tokens
+
+**File:** `src/rewards/RewardDistributor.sol`, lines 119–129
+
+**What an attacker can do:**
+Any account that has ever had a non-zero `accrued[account]` balance can call `claim()` repeatedly and extract those tokens each time until the distributor's reward-token balance is fully drained.
+
+**Root cause:**
+`claim()` never zeroes `accrued[msg.sender]`. After the call, `userIndex[msg.sender]` is set to `globalIndex`, which makes `_pendingFor` return 0 — but `accrued[msg.sender]` retains its old value. The next call to `claim()` computes `amount = accrued[msg.sender] + 0`, finds a non-zero amount, and transfers it again.
+
+```solidity
+// claim() as written — accrued is read but never cleared
+amount = accrued[msg.sender] + _pendingFor(msg.sender);
+// ...
+userIndex[msg.sender] = globalIndex;   // zeroes _pendingFor
+totalClaimed += amount;
+rewardToken.safeTransfer(msg.sender, amount);
+// accrued[msg.sender] is still the old value
+```
+
+**Conditions required:**
+1. At least one `notifyReward` call has occurred while the attacker held shares.
+2. The attacker has subsequently triggered a `checkpoint` for their account (i.e., called `deposit` or `requestWithdrawal` a second time after a reward notification), which sets `accrued[attacker] > 0`.
+3. The attacker calls `claim()` any number of times.
+
+The `nonReentrant` guard does not prevent this: each call is a fresh, completed transaction. The test suite (`test_DepositCheckpointsEarlierEntitlement`) covers exactly the scenario where `accrued` becomes non-zero, but only asserts on a single `claim()` call, masking the bug.
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer.
+
+---
+
+### MEDIUM — `FixedPointMath.sol::mulDiv()` — Unchecked intermediate overflow causes revert (DoS)
+
+**File:** `src/libraries/FixedPointMath.sol`, line 14
+
+**What an attacker can do:**
+No attacker action is needed — the overflow can happen under normal operation. Specifically, `notifyReward` and `_pendingFor` both call `mulDiv` with a WAD-scaled operand. If either `amount * WAD` (in `notifyReward`) or `balance * delta` (in `_pendingFor`) exceeds `2^256 - 1`, the 0.8.x checked arithmetic reverts the transaction. This could permanently brick `notifyReward` or block any staker from ever calling `claim()` once global state reaches the overflow threshold.
+
+```solidity
+// naive implementation — x*y may overflow before dividing
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;
+}
+```
+
+- `notifyReward` overflows when `amount > ~1.16 × 10^59` (≈ `2^256 / 1e18`).
+- `_pendingFor` overflows when `balance * (globalIndex − userIndex) > 2^256`. After many notifications with a small staker base, `globalIndex` can grow large enough to trigger this for even a moderate balance.
+
+**Conditions required:**
+Token supplies or reward amounts in the high-magnitude range, or accumulated reward notifications that push `globalIndex` high enough that the product with a normal staker balance overflows.
+
+**Fix:** Replace `mulDiv` with a 512-bit multiply-then-divide (e.g., Solmate's `FullMath.mulDiv`) that avoids intermediate overflow.
+
+---
+
+### LOW — `StakingVault.sol::completeWithdrawal()` — Fee recipient not locked at request time
+
+**File:** `src/core/StakingVault.sol`, line 173
+
+**What an attacker can do:**
+The owner (or a compromised owner key) can redirect fees from in-flight withdrawal requests to an arbitrary address. The fee *rate* is correctly frozen in the `WithdrawalQueue.Request` struct at request time, but the fee *destination* is read live from `feeController.feeRecipient()` at settlement time.
+
+```solidity
+// feeBps is locked — feeController.feeRecipient() is not
+asset.safeTransfer(feeController.feeRecipient(), fee);
+```
+
+**Conditions required:** Owner calls `FeeController.setFeeRecipient` after a user's withdrawal request is queued but before the cooldown expires.
+
+**Fix:** Capture `feeController.feeRecipient()` in `requestWithdrawal` and store it alongside `feeBps` in the `WithdrawalQueue.Request` struct, or document explicitly that this is intended behavior.
+
+---
+
+### LOW — `StakingVault.sol` — Residual `totalAssets` after full exit contaminates next depositor's share price
+
+**Files:** `src/core/StakingVault.sol` (`requestWithdrawal`, `convertToAssets`, `convertToShares`)
+
+**What an attacker can do:**
+No attacker action is required. Due to floor-rounding in `convertToAssets`, it is possible for `totalAssets` to be left at 1–few wei while `totalSupply` reaches exactly 0. When the next depositor calls `deposit`, `convertToShares` takes the `supply == 0` branch and returns `assets` 1-for-1, but `totalAssets` is then set to `residual + assets`. The depositor immediately holds shares whose `convertToAssets` value exceeds what they paid, effectively gifting them the dust that prior stakers forfeited to rounding.
+
+**Conditions required:**
+All stakers must exit, and rounding must leave a non-zero residual in `totalAssets`. At typical 18-decimal scales the amount is a few wei and the economic impact is negligible, but the invariant stated in the contract header (`totalSupply == 0 ⟺ totalAssets == 0`) is violated.
+
+**Fix:** In `requestWithdrawal`, if the resulting `totalSupply == 0`, also set `totalAssets = 0` to flush any rounding residual.
+
+---
+
+### INFORMATIONAL — `Ownable2Step.sol::transferOwnership()` — Allows nominating `address(0)` as pending owner
+
+**File:** `src/auth/Ownable2Step.sol`, line 31
+
+**What an attacker can do:**
+Nothing exploitable. `address(0)` can never call `acceptOwnership()`, so the ownership transfer cannot complete. The current owner retains full control and can overwrite `pendingOwner` with a new `transferOwnership` call. However, the missing zero-address check is inconsistent with the pattern applied elsewhere in the codebase (constructors, `setFeeRecipient`, etc.) and could cause confusion in operational monitoring.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` at the top of `transferOwnership`.
+
+---
+
+### Summary table
+
+| # | Severity | Contract | Function | Issue |
+|---|----------|----------|----------|-------|
+| 1 | Critical | `RewardDistributor` | `claim()` | `accrued` not zeroed; unlimited re-claim |
+| 2 | Medium | `FixedPointMath` | `mulDiv()` | Intermediate overflow → revert DoS |
+| 3 | Low | `StakingVault` | `completeWithdrawal()` | Fee recipient not locked at request time |
+| 4 | Low | `StakingVault` | `requestWithdrawal()` | Rounding residual breaks `totalSupply==0 ⟺ totalAssets==0` invariant |
+| 5 | Info | `Ownable2Step` | `transferOwnership()` | No zero-address guard on `pendingOwner` |

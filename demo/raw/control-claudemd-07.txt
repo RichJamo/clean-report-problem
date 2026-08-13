@@ -1,0 +1,164 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            07
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:25:55Z
+# duration-ms:    374148
+# num-turns:      14
+# context-tokens: 94605
+# output-tokens:  22268
+# cost-usd:       0.4314213
+# is-error:       False
+# session-id:     ec152e1d-96f8-4e01-be22-0ba422dee337
+# ---- agent output below this line ----
+Now I have a thorough picture of every contract. Let me write the audit report.
+
+---
+
+## Security Audit Report
+
+**Scope:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `SafeTransferLib`, `FixedPointMath`
+
+---
+
+### CRITICAL-1 — Reward tokens can be drained repeatedly via `claim()`
+
+**File:** `src/rewards/RewardDistributor.sol` — `claim()` (line 119)
+
+**What an attacker can do:** Drain the entire reward token balance of `RewardDistributor` across repeated transactions at zero cost beyond gas.
+
+**Root cause:** `claim()` correctly updates `userIndex[msg.sender]` to prevent double-counting of *pending* (live) rewards, but it **never zeroes `accrued[msg.sender]`**. Every subsequent call re-reads the stale `accrued` value and transfers it again.
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;   // clears pending
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);  // pays out accrued + pending
+    // ← accrued[msg.sender] is never cleared
+}
+```
+
+**Conditions required:**
+
+1. At least one `notifyReward` call has occurred while the attacker held shares.
+2. The attacker's balance subsequently changes (they call `deposit` or `requestWithdrawal`), which triggers `_checkpoint` and moves earned rewards from *pending* into `accrued[attacker]`.
+3. Attacker calls `claim()` in a loop.
+
+**Attack trace:**
+
+```
+Alice deposits 100 tokens
+owner calls notifyReward(10)          → globalIndex = 0.1e18
+Alice calls deposit(1)                → _checkpoint moves 10 into accrued[alice]
+Alice calls claim()                   → paid 10, accrued[alice] still = 10
+Alice calls claim()                   → paid 10 again, accrued[alice] still = 10
+... repeats until reward pool is empty
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+### MEDIUM-1 — `FixedPointMath.mulDiv` uses unchecked intermediate multiplication
+
+**File:** `src/libraries/FixedPointMath.sol` — `mulDiv()` (line 14)
+
+**What an attacker can do:** Force permanent DoS on `deposit`, `requestWithdrawal`, `accrueYield`, or `notifyReward` by putting the system into a state where the intermediate product `x * y` overflows `uint256`.
+
+**Root cause:** The implementation uses plain Solidity multiplication (`x * y`) before dividing. Solidity 0.8.x will revert on overflow rather than wrap, so the result is always arithmetically correct — but the revert behaviour means specific token/share ratios can make entire code paths permanently unexecutable.
+
+```solidity
+function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+    return (x * y) / d;   // x * y can revert for large x, y
+}
+```
+
+The most exposed call sites are:
+
+| Call | Overflows when |
+|---|---|
+| `assets.mulDiv(supply, totalAssets)` in `convertToShares` | `assets * totalSupply > 2²⁵⁶` |
+| `amount.mulDiv(WAD, supply)` in `notifyReward` | `amount * 1e18 > 2²⁵⁶` (i.e., `amount > ~1.16 × 10⁵⁹`) |
+
+For tokens with 18 decimals, reaching these limits requires extraordinary values, making this low-probability but not impossible for tokens with very large supplies. A 512-bit intermediate (using Solady- or OZ-style `mulDiv`) eliminates the risk entirely.
+
+**Conditions required:** `x * y > 2²⁵⁶ − 1` in any of the above call sites. The `totalSupply` and `totalAssets` values are operator-controlled (via `accrueYield`), so the owner could inadvertently trigger this.
+
+---
+
+### LOW-1 — `requestWithdrawal` silently burns shares for zero assets
+
+**File:** `src/core/StakingVault.sol` — `requestWithdrawal()` (line 143)
+
+**What an attacker can do:** Trigger share burns that return 0 assets, which permanently reduces other shareholders' denominators without reducing the numerator (`totalAssets`), inflating the share price at the victim's expense.
+
+**Root cause:** After computing `assets = convertToAssets(shares)`, there is no guard against `assets == 0`. With extreme share/asset ratios (e.g., `totalAssets = 1`, `totalSupply = 1e18`), a dust withdrawal returns zero assets while still burning the shares and reducing `totalSupply`, causing the share price to jump.
+
+**Conditions required:** `shares * totalAssets / totalSupply` rounds to zero — i.e., `shares < totalSupply / totalAssets`. Requires unusual ratios (cannot arise organically from normal deposits alone, but could follow specific patterns of rounding-accumulated drift or very small yield accruals).
+
+---
+
+### LOW-2 — Fee recipient is read at *completion* time, not at *request* time
+
+**File:** `src/core/StakingVault.sol` — `completeWithdrawal()` (line 166); `src/core/FeeController.sol` — `setFeeRecipient()` (line 51)
+
+**What an attacker can do:** An owner (or a compromised owner key) can redirect fee revenue to an arbitrary address by calling `FeeController.setFeeRecipient()` between when a withdrawal is queued and when it is completed.
+
+**Root cause:** `withdrawalQueue.enqueue` locks in the fee *rate* (`feeBps`) at request time (correct), but `completeWithdrawal` calls `feeController.feeRecipient()` live:
+
+```solidity
+asset.safeTransfer(feeController.feeRecipient(), fee);   // recipient evaluated at completion
+```
+
+**Conditions required:** Owner (or compromised owner key) monitors the mempool for large pending withdrawals and updates `feeRecipient` before they settle.
+
+---
+
+### LOW-3 — Tokens sent directly to the vault are permanently locked
+
+**File:** `src/core/StakingVault.sol`
+
+**What an attacker can do:** An attacker (or an accidentally misconfigured integration) can permanently remove tokens from circulation by sending them directly to the vault address.
+
+**Root cause:** The vault intentionally tracks `totalAssets` in storage rather than via `balanceOf(address(this))`, so direct transfers are invisible to the accounting. There is no owner sweep or rescue function. The comment at line 18–20 documents this as a design choice, but the consequence is that any direct-transfer tokens are irrecoverable.
+
+**Conditions required:** Any ERC-20 `transfer` directly to the vault address.
+
+---
+
+### INFO-1 — `guardian` can be silently set to `address(0)`, disabling the role
+
+**File:** `src/core/StakingVault.sol` — `setGuardian()` (line 201)
+
+`setGuardian` accepts `address(0)` without reverting. After such a call, only the owner can pause, but the event `GuardianUpdated(old, address(0))` still fires, which could mislead monitoring infrastructure that expects a live guardian. The constructor already permits a zero guardian (`initialGuardian` has no zero-check), making this pattern consistent but worth noting.
+
+---
+
+### INFO-2 — Owner can pause the vault indefinitely
+
+**File:** `src/core/StakingVault.sol` — `pause()` / `unpause()` (lines 207, 214)
+
+`unpause()` is `onlyOwner` with no time bound. If the owner key is lost or the owner is malicious, deposits can be halted permanently. Withdrawals remain functional (by design), which mitigates user-fund risk, but new capital cannot enter and `accrueYield` is also blocked under pause.
+
+---
+
+### Summary Table
+
+| ID | Severity | Contract | Function | Impact |
+|---|---|---|---|---|
+| CRITICAL-1 | Critical | `RewardDistributor` | `claim()` | Full drain of reward pool |
+| MEDIUM-1 | Medium | `FixedPointMath` | `mulDiv()` | DoS on core vault operations |
+| LOW-1 | Low | `StakingVault` | `requestWithdrawal()` | Share-for-zero-asset burns inflate price |
+| LOW-2 | Low | `StakingVault` / `FeeController` | `completeWithdrawal()` | Fee redirection by owner |
+| LOW-3 | Low | `StakingVault` | — | Permanent token lock on direct transfer |
+| INFO-1 | Info | `StakingVault` | `setGuardian()` | Silent role disablement |
+| INFO-2 | Info | `StakingVault` | `pause()` | Indefinite deposit freeze |
+
+The most urgent fix is **CRITICAL-1**: add `accrued[msg.sender] = 0;` in `RewardDistributor.claim()` before the transfer. All other findings are either inherent to the owner trust model or edge-case arithmetic concerns.

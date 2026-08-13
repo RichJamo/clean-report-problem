@@ -1,0 +1,17 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            10
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:44:30Z
+# duration-ms:    229792
+# num-turns:      11
+# context-tokens: 50484
+# output-tokens:  13177
+# cost-usd:       0.25654335
+# is-error:       True
+# session-id:     c349956e-f7b5-42a9-9b3d-490d45d87f2d
+# ---- agent output below this line ----
+You've hit your limit · resets 9:10pm (Africa/Johannesburg)

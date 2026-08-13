@@ -1,0 +1,128 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            08
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:32:10Z
+# duration-ms:    252696
+# num-turns:      15
+# context-tokens: 97142
+# output-tokens:  14712
+# cost-usd:       0.3199257
+# is-error:       False
+# session-id:     d36c80e9-0275-4e1d-913f-aca553b0ef8b
+# ---- agent output below this line ----
+Now I have a full picture of the codebase. Let me compile the audit report.
+
+---
+
+## Security Audit Report
+
+**Project:** StakingVault / RewardDistributor  
+**Files audited:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol`, `src/rewards/RewardDistributor.sol`, `src/auth/Ownable2Step.sol`, `src/libraries/FixedPointMath.sol`, `src/libraries/SafeTransferLib.sol`
+
+---
+
+### CRITICAL — Double-spend in `RewardDistributor.claim()`
+
+**File:** `src/rewards/RewardDistributor.sol`, function `claim()` (line 119)
+
+**What an attacker can do:** Drain all reward tokens from `RewardDistributor` by calling `claim()` repeatedly from a single transaction or across multiple transactions.
+
+**Root cause:** `accrued[msg.sender]` is read and paid out, but **never reset to zero**. After the first claim, `userIndex[msg.sender]` is advanced to `globalIndex`, so `_pendingFor` correctly returns 0. However, `accrued[msg.sender]` retains its previous value. Every subsequent call to `claim()` computes `amount = accrued[msg.sender] + 0`, passes the `NothingToClaim` guard, and transfers the same tokens again.
+
+```solidity
+function claim() external nonReentrant returns (uint256 amount) {
+    amount = accrued[msg.sender] + _pendingFor(msg.sender);
+    if (amount == 0) revert NothingToClaim();
+
+    userIndex[msg.sender] = globalIndex;
+    totalClaimed += amount;
+
+    rewardToken.safeTransfer(msg.sender, amount);   // paid out
+    // ← accrued[msg.sender] is never cleared
+    emit Claimed(msg.sender, amount);
+}
+```
+
+**Conditions required:**
+1. `accrued[msg.sender]` must be non-zero. This is set by `checkpoint`, which the vault calls on every `deposit` and every `requestWithdrawal` — routine, expected user actions.
+2. At least one `notifyReward` must have occurred between the user's initial stake and the triggering `deposit`/`requestWithdrawal`.
+
+**Concrete attack sequence:**
+1. Attacker stakes any amount.
+2. Owner calls `notifyReward`.
+3. Attacker calls `deposit(1)` (dust), causing a checkpoint: `accrued[attacker] = earned_rewards`, `userIndex[attacker] = globalIndex`.
+4. Attacker calls `claim()` → legitimate payout. `accrued[attacker]` stays non-zero.
+5. Attacker calls `claim()` again — transfers the same amount a second time.
+6. Repeat until the contract's reward token balance is exhausted.
+
+**Fix:** Add `accrued[msg.sender] = 0;` before or after the transfer in `claim()`.
+
+---
+
+### MEDIUM — `FixedPointMath.mulDiv` uses naïve intermediate product
+
+**File:** `src/libraries/FixedPointMath.sol`, function `mulDiv()` (line 14)
+
+**What an attacker can do:** Trigger a permanent denial-of-service on core vault operations by depositing or staking amounts that cause `x * y` to overflow `uint256`, reverting the transaction. Because the condition persists until the share/asset ratio changes, an attacker who reaches the overflow threshold traps subsequent users' interactions.
+
+**Root cause:** The implementation is `(x * y) / d`. Solidity 0.8 arithmetic reverts on overflow. No 512-bit intermediate (as in Uniswap v3's `FullMath` or OZ's `Math.mulDiv`) is used.
+
+**Affected call sites:**
+- `convertToShares`: `assets.mulDiv(supply, totalAssets)` — overflows when `assets * supply > 2^256`.
+- `convertToAssets`: `shares.mulDiv(totalAssets, supply)`.
+- `notifyReward`: `amount.mulDiv(WAD, supply)` — overflows when `amount * 1e18 > 2^256`, i.e., `amount > ~1.16 × 10^59`. With 18-decimal tokens this requires a supply on the order of 10^41, which exceeds realistic ERC-20 parameters but is technically achievable.
+- `_pendingFor`: `balance.mulDiv(delta, WAD)` — same concern if `balance * globalIndex_delta` overflows.
+
+**Conditions required:** Token supplies and notified reward amounts must be very large. Under typical 18-decimal ERC-20 parameters the threshold is not reached, but the lack of full-precision multiplication is a latent risk if unusual tokens or amounts are ever used.
+
+**Fix:** Replace the body of `mulDiv` with a full 512-bit intermediary (equivalent to OpenZeppelin `Math.mulDiv`).
+
+---
+
+### LOW — Reentrancy sentinel initialized to zero instead of one
+
+**File:** `src/core/StakingVault.sol` (line 59) and `src/rewards/RewardDistributor.sol` (line 46)
+
+**What an attacker can do:** This is not an exploitable security issue; the guard is logically correct. However, every call to a `nonReentrant`-protected function pays a cold `SSTORE` cost (20,000 gas) because `_entered` transitions `0 → 1 → 0` each time, keeping the slot cold before each invocation.
+
+**Root cause:** The standard pattern initialises the slot to `1` (warm) and locks at `2`, so every call only pays a warm `SSTORE` (2,900 gas). Using `0/1` means every call starts from a zeroed slot.
+
+**Fix:** Initialise `_entered = 1` in both contracts and change the guard to `if (_entered == 2) revert Reentrancy(); _entered = 2; _; _entered = 1;`.
+
+---
+
+### LOW — `Ownable2Step.transferOwnership` accepts `address(0)` as `pendingOwner`
+
+**File:** `src/auth/Ownable2Step.sol`, function `transferOwnership()` (line 30)
+
+**What an attacker can do:** An owner who accidentally calls `transferOwnership(address(0))` silently cancels any in-flight ownership transfer with no indication other than the event. Since `address(0)` can never call `acceptOwnership`, the effect is an invisible no-op that could mask a typo where the owner intended to transfer to a real address.
+
+**Conditions required:** Owner error only. Cannot be triggered by a third party.
+
+**Fix:** Add `require(newOwner != address(0), "OWNER_ZERO");` at the top of `transferOwnership`, consistent with the zero-address check in the constructor.
+
+---
+
+### INFORMATIONAL — `rewardDistributor` is a trusted, unvalidated external call site
+
+**File:** `src/core/StakingVault.sol`, function `_checkpoint()` (line 222)
+
+The vault unconditionally calls `distributor.checkpoint(account)` from inside both `deposit` and `requestWithdrawal` — both of which are protected by `nonReentrant`. Reentrancy into the vault is therefore blocked. However, if the owner sets a malicious `rewardDistributor` (possible exactly once via `setRewardDistributor`), the checkpoint call executes arbitrary code with `_entered = 1` set, allowing the malicious contract to call view functions or other contracts freely. No vault funds are directly at risk from reentrancy, but a malicious distributor could read in-flight state or perform external actions mid-execution. This is a trust assumption worth documenting explicitly in the NatSpec for `setRewardDistributor`.
+
+---
+
+### Summary table
+
+| Severity | Title | File | Function |
+|---|---|---|---|
+| Critical | `accrued` never cleared → infinite claim | `RewardDistributor.sol` | `claim()` |
+| Medium | Naïve `mulDiv` overflows on large inputs | `FixedPointMath.sol` | `mulDiv()` |
+| Low | Reentrancy sentinel 0/1 wastes gas | Both vault contracts | `nonReentrant` modifier |
+| Low | `transferOwnership(address(0))` silently no-ops | `Ownable2Step.sol` | `transferOwnership()` |
+| Info | Unvalidated external `checkpoint` call | `StakingVault.sol` | `_checkpoint()` |
+
+The most urgent fix is the `claim()` bug — it is exploitable by any normal user in the expected usage pattern and will drain the entire reward token balance.

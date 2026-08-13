@@ -1,0 +1,158 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      control-claudemd
+# run:            09
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:36:24Z
+# duration-ms:    265923
+# num-turns:      18
+# context-tokens: 168113
+# output-tokens:  14672
+# cost-usd:       0.3783585
+# is-error:       False
+# session-id:     22f4aef7-17f1-409b-967f-b2b749712ca2
+# ---- agent output below this line ----
+I have read every source file. Here is the audit report.
+
+---
+
+# Security Audit Report
+
+**Scope:** `src/` — `StakingVault`, `FeeController`, `WithdrawalQueue`, `RewardDistributor`, `Ownable2Step`, `SafeTransferLib`, `FixedPointMath`
+**Compiler:** Solidity 0.8.24, optimizer 200 runs
+
+---
+
+## Critical
+
+### C-1 — `RewardDistributor.claim()` never clears `accrued`, enabling unlimited double-claiming
+
+**File:** `src/rewards/RewardDistributor.sol`, `claim()` (line 119)
+
+**What an attacker can do:** Any account whose `accrued` mapping has been set to a non-zero value by `checkpoint()` can call `claim()` in a loop and drain the entire reward-token balance of the distributor, collecting the same accrued rewards on every iteration.
+
+**How it happens:** `claim()` computes `amount = accrued[msg.sender] + _pendingFor(msg.sender)`, transfers `amount`, and sets `userIndex[msg.sender] = globalIndex` — which zeros `_pendingFor` for the next call. However, it never executes `accrued[msg.sender] = 0`. On the very next call `_pendingFor` returns 0, but `accrued[msg.sender]` still holds its old value, so `amount` is non-zero again, the transfer goes through, and the loop can repeat until the contract is emptied. The `totalClaimed` counter is also inflated by each duplicate payout, making on-chain accounting unreliable.
+
+**Conditions required:**
+1. At least one `checkpoint(account)` call must have occurred after a `notifyReward` so that `accrued[account] > 0`. This happens automatically whenever the account makes a second deposit or any withdrawal request after rewards have been distributed.
+2. The distributor must hold enough reward-token balance to satisfy the transfer (the first legitimate claim depletes the "real" entitlement; subsequent calls steal from other stakers' shares).
+
+**Proof of path:**
+```
+Alice stakes → notifyReward(50) → Alice deposits again
+  → vault calls checkpoint(Alice): accrued[Alice] = 50, userIndex = globalIndex
+
+Alice calls claim():             // amount = 50 + 0 = 50, transfer ✓
+  accrued[Alice] still == 50 ✗  // BUG: never cleared
+
+Alice calls claim() again:       // amount = 50 + 0 = 50, transfer ✓ (theft)
+Alice calls claim() again: ...   // repeats until distributor is empty
+```
+
+**Fix:** Add `accrued[msg.sender] = 0;` before the transfer in `claim()`.
+
+---
+
+## High
+
+### H-1 — `rewardDistributor` is immutable after first set; a compromised distributor cannot be replaced
+
+**File:** `src/core/StakingVault.sol`, `setRewardDistributor()` (line 194)
+
+**What an attacker can do:** If the distributor contract is exploited (e.g., via C-1 above), the vault owner has no mechanism to point the vault at a replacement. All future deposits and withdrawals will continue to invoke `_checkpoint` on the broken/drained distributor.
+
+**Conditions required:** The `rewardDistributor` has been set once. No further changes are possible regardless of circumstances. The bug in C-1 makes this especially acute because the known-buggy distributor can never be swapped out.
+
+---
+
+## Medium
+
+### M-1 — `completeWithdrawal` can be permanently griefed by a malicious or reverting fee recipient
+
+**File:** `src/core/StakingVault.sol`, `completeWithdrawal()` (line 166)
+
+**What an attacker can do:** If `feeController.feeRecipient()` is set to a contract that reverts on `transfer` (e.g., a contract with a reverting `fallback`, or a token that blacklists the vault), every call to `completeWithdrawal` where `fee != 0` will revert. Users with pending withdrawal requests cannot collect their funds until the owner changes the fee recipient. If the owner is unavailable or malicious, this is a permanent DoS of all exits.
+
+**Conditions required:**
+- `feeBps > 0` for the affected withdrawal requests (requests with `feeBps == 0` are unaffected).
+- The FeeController owner sets `feeRecipient` to an address that rejects the staked asset token. There is no capability check on `setFeeRecipient` beyond the zero-address guard.
+
+**Note:** The FeeController owner and the vault owner need not be the same address in a deployment; a compromised FeeController owner alone can trigger this.
+
+---
+
+### M-2 — Fee recipient destination is not locked at request time, only the fee rate is
+
+**File:** `src/core/StakingVault.sol`, `completeWithdrawal()` (line 169); `src/core/WithdrawalQueue.sol`, `Request` struct
+
+**What an attacker can do:** The `feeBps` applied at settlement is correctly snapshotted at request time (stored in `Request.feeBps`). However, `feeController.feeRecipient()` is read live at settlement time. If the fee recipient is changed between a user's `requestWithdrawal` and their `completeWithdrawal`, the fee is silently redirected to the new recipient. A malicious FeeController owner can change the recipient to themselves just before users complete withdrawals to capture fees from requests they did not have the rate for.
+
+**Conditions required:** `feeBps > 0` on the pending request; FeeController owner changes `feeRecipient` in the window between request and settlement.
+
+---
+
+## Low
+
+### L-1 — `setGuardian` accepts `address(0)` without warning
+
+**File:** `src/core/StakingVault.sol`, `setGuardian()` (line 201)
+
+**What an attacker can do:** If the owner mistakenly sets `guardian = address(0)`, the guardian role is silently removed. Pause capability is not lost (the owner retains it), but the intended redundancy is eliminated without any revert or obvious signal.
+
+**Conditions required:** Owner calls `setGuardian(address(0))`.
+
+---
+
+### L-2 — `FixedPointMath.mulDiv` uses naive multiplication; overflows revert instead of computing correctly
+
+**File:** `src/libraries/FixedPointMath.sol`, `mulDiv()` (line 14)
+
+**What an attacker can do:** The implementation is `(x * y) / d`. Under Solidity 0.8's checked arithmetic, if `x * y > type(uint256).max` the whole transaction reverts. In `_pendingFor`, the product is `vault.balanceOf(account) * delta` where `delta = globalIndex - userIndex[account]`. A user who has never checkpointed while `globalIndex` has grown through many reward distributions will have a large `delta`. If their balance is also large, this product can overflow, permanently preventing them from claiming rewards or successfully completing a `deposit`/`requestWithdrawal` (both call `_checkpoint`). The threshold is high but reachable in a long-lived, high-reward vault.
+
+**Conditions required:** An account with a large share balance that has not been checkpointed for many `notifyReward` epochs, causing `balance * (globalIndex - userIndex[account])` to exceed `2^256 − 1`.
+
+---
+
+### L-3 — `nonReentrant` guard initialized to `0` rather than `1`, costing unnecessary gas per call
+
+**File:** `src/core/StakingVault.sol` (line 59, 77); `src/rewards/RewardDistributor.sol` (line 46, 58)
+
+The guard uses the pattern `0 → 1 → 0`. Because the storage slot starts cold at zero, the first write from 0→1 costs 20,000 gas (a cold SSTORE), and the reset 1→0 produces a refund. The conventional 1/2 pattern (initialize to 1 in the constructor, toggle to 2 during execution) costs only 2,900 gas per call and avoids the refund accounting. This is not a security vulnerability but is worth correcting for gas efficiency.
+
+---
+
+## Informational
+
+### I-1 — `Ownable2Step.transferOwnership(address(0))` emits a misleading event
+
+**File:** `src/auth/Ownable2Step.sol`, `transferOwnership()` (line 30)
+
+Calling `transferOwnership(address(0))` sets `pendingOwner = address(0)` and emits `OwnershipTransferStarted(owner, address(0))`. Since nobody can call `acceptOwnership` as `address(0)`, this is effectively a no-op that cancels a prior pending transfer, but off-chain monitors may misinterpret the event as an attempt to renounce ownership.
+
+---
+
+### I-2 — No mechanism to cancel a pending withdrawal request
+
+**File:** `src/core/WithdrawalQueue.sol`
+
+Once `requestWithdrawal` is called, shares are burned and assets leave accounting. There is no cancel path. A user who changes their mind must wait through the cooldown, complete the withdrawal (paying the fee), and re-deposit. This is a UX limitation and a minor lock-in during market events.
+
+---
+
+## Summary Table
+
+| ID  | Severity    | Location                                    | Title |
+|-----|-------------|---------------------------------------------|-------|
+| C-1 | Critical    | `RewardDistributor.claim()`                 | `accrued` never cleared — unlimited double-claim |
+| H-1 | High        | `StakingVault.setRewardDistributor()`       | Immutable distributor with no upgrade path |
+| M-1 | Medium      | `StakingVault.completeWithdrawal()`         | Reverting fee recipient DoS all exits |
+| M-2 | Medium      | `StakingVault.completeWithdrawal()`         | Fee destination not snapshotted at request time |
+| L-1 | Low         | `StakingVault.setGuardian()`                | Guardian can be set to zero address silently |
+| L-2 | Low         | `FixedPointMath.mulDiv()`                   | Naive multiply overflows for large index × balance |
+| L-3 | Low         | `StakingVault`, `RewardDistributor`         | 0/1 reentrancy guard wastes gas per call |
+| I-1 | Info        | `Ownable2Step.transferOwnership()`          | `address(0)` transfer emits misleading event |
+| I-2 | Info        | `WithdrawalQueue`                           | No withdrawal cancellation |
+
+The single highest-priority fix is **C-1**: add `accrued[msg.sender] = 0;` in `RewardDistributor.claim()` before the transfer. Without it, anyone who has ever been checkpointed with a non-zero accrued balance can drain the entire reward pool.

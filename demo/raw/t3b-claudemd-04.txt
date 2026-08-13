@@ -1,0 +1,147 @@
+# clean-report-problem raw run output
+# This file is committed verbatim. It is the evidence.
+# condition:      t3b-claudemd
+# run:            04
+# model:          claude-haiku-4-5-20251001, claude-sonnet-4-6
+# cli:            claude 2.1.142
+# prompt-sha256:  d338515d64ee5cf712700d2d88a567f0874866c40ab9c4696de5486b03965c02
+# started-utc:    2026-08-12T16:05:03Z
+# duration-ms:    469486
+# num-turns:      12
+# context-tokens: 129389
+# output-tokens:  26826
+# cost-usd:       0.56364975
+# is-error:       False
+# session-id:     b929bebc-e543-43f7-a6f2-5201cc50e983
+# ---- agent output below this line ----
+I now have everything I need to write the report.
+
+---
+
+## Security Audit Report — `src/core/`
+
+**Scope:** `src/core/StakingVault.sol`, `src/core/FeeController.sol`, `src/core/WithdrawalQueue.sol` (and their direct imports where bugs manifest in core).
+**Out of scope:** `src/rewards/`, `test/`, `src/interfaces/`.
+
+---
+
+### [H-1] Irrevocable `rewardDistributor` can permanently lock all user shares
+
+**File / function:** `StakingVault.sol` — `setRewardDistributor` (line 194), `_checkpoint` (line 222), called from `deposit` (line 127) and `requestWithdrawal` (line 149).
+
+**What an attacker / failure mode can do:**
+`_checkpoint` is an external call that sits at the top of both `deposit` and `requestWithdrawal`. If the distributor contract ever starts reverting — due to a bug, a failed upgrade, self-destruction, or an access-control change that blocks the vault — every new `deposit` and every `requestWithdrawal` reverts permanently. Users who already hold shares but have not yet queued a withdrawal cannot exit: `requestWithdrawal` reverts, so their shares are frozen in place with no recovery path in the vault.
+
+`completeWithdrawal` does not call `_checkpoint`, so users who already have a queued request can still collect. But any staker whose shares are unqueued at the time the distributor breaks is stuck.
+
+**Conditions required:**
+`setRewardDistributor` has been called once (the `DistributorAlreadySet` guard ensures it cannot be called again). There is no `removeRewardDistributor`, no upgrade path, and no owner-callable rescue function. Any of the following triggers the freeze: a bug in `distributor.checkpoint`, an out-of-gas griefing function in the distributor, an upgrade to a broken implementation, or a governance vote that removes the vault's caller privilege on the distributor.
+
+**Recommendation:** Add an owner-controlled escape hatch — either a `removeRewardDistributor` that sets the address back to zero, or allow the owner to replace it. Alternatively, wrap the `distributor.checkpoint` call in a try/catch so that a broken distributor degrades gracefully (rewards stop accruing) without blocking exits.
+
+---
+
+### [M-1] `FixedPointMath.mulDiv` uses unchecked intermediate multiplication and can overflow
+
+**File / function:** `src/libraries/FixedPointMath.sol` — `mulDiv` (line 14); manifests in `StakingVault.sol` — `convertToShares` (line 110), `convertToAssets` (line 117), `completeWithdrawal` (line 169).
+
+**What an attacker can do:**
+`mulDiv` computes `(x * y) / d` using ordinary 256-bit arithmetic. If `x * y` exceeds `type(uint256).max`, Solidity 0.8's checked arithmetic reverts. If this overflow is reached, `convertToShares` and `convertToAssets` both revert, making `deposit`, `requestWithdrawal`, and the fee calculation in `completeWithdrawal` all permanently unavailable.
+
+The unsafe product in `convertToAssets` is `shares * totalAssets`. Overflow occurs when their product exceeds ~1.16 × 10⁷⁷. For a token with 18 decimals this threshold is reached if both quantities approach 2¹²⁸ (≈ 3.4 × 10²⁰ token units, i.e., ~340 billion whole tokens), which is unlikely for most assets but not impossible for high-supply tokens over a long vault lifetime. The product in `convertToShares` (`assets * supply`) is similarly affected; here `assets` is caller-supplied, so a large enough deposit call can trigger the revert deliberately.
+
+**Conditions required:**
+The vault accumulates enough tokens that the product of shares and totalAssets (or assets and totalSupply) overflows uint256. A well-capitalised vault dealing in a high-supply token is the realistic scenario; a deliberate large-asset deposit is a lower-likelihood griefing vector.
+
+**Recommendation:** Replace the bare `(x * y) / d` with a 512-bit multiply-then-divide (e.g., the algorithm used in Uniswap v3's `FullMath` or OpenZeppelin's `Math.mulDiv`), which avoids the intermediate overflow entirely.
+
+---
+
+### [L-1] `completeWithdrawal` reads the fee recipient at settlement time, not at request time
+
+**File / function:** `StakingVault.sol` — `completeWithdrawal` (lines 172–174).
+
+**What an attacker can do:**
+`feeBps` is correctly snapshotted into the `WithdrawalQueue.Request` when `requestWithdrawal` is called, so a later fee change cannot alter the rate applied to an in-flight exit. However, the destination for those collected fees is read live from `feeController.feeRecipient()` at the moment `completeWithdrawal` executes:
+
+```solidity
+asset.safeTransfer(feeController.feeRecipient(), fee);
+```
+
+If the `FeeController` owner changes `feeRecipient` between request and settlement, all fees from all pending withdrawals are silently redirected to the new address. This allows the `FeeController` owner (who may be a different key than the `StakingVault` owner) to front-run settlements and redirect fee revenue.
+
+**Conditions required:**
+`FeeController` owner changes `feeRecipient` while withdrawal requests are in the cooldown period.
+
+**Recommendation:** Snapshot `feeRecipient` in `WithdrawalQueue.Request` alongside `feeBps`, or document clearly that the fee destination is intentionally mutable and that the `FeeController` owner has this power over pending exits.
+
+---
+
+### [L-2] `setGuardian` does not reject `address(0)`
+
+**File / function:** `StakingVault.sol` — `setGuardian` (line 201).
+
+**What an attacker can do:**
+No input validation is performed:
+
+```solidity
+function setGuardian(address newGuardian) external onlyOwner {
+    emit GuardianUpdated(guardian, newGuardian);
+    guardian = newGuardian;
+}
+```
+
+Calling `setGuardian(address(0))` silently removes the guardian role. The `pause()` check (`msg.sender != owner && msg.sender != guardian`) does not revert when `guardian == address(0)` — it simply means only the owner can pause. An operator expecting a guardian to be able to pause in an emergency would lose that capability without any revert or clear indication.
+
+**Conditions required:**
+Owner passes `address(0)` by mistake or an attacker tricks the owner into doing so.
+
+**Recommendation:** Add `require(newGuardian != address(0), "GUARDIAN_ZERO")` or a custom error, matching the pattern used in the `FeeController` constructor and `setFeeRecipient`.
+
+---
+
+### [L-3] Checks-Effects-Interactions order violated in `deposit`
+
+**File / function:** `StakingVault.sol` — `deposit` (lines 127–138).
+
+**What happens:**
+Storage is mutated (`totalAssets`, `totalSupply`, `balanceOf`) before the token pull (`safeTransferFrom`). Additionally, `_checkpoint` — an external call into an arbitrary `rewardDistributor` contract — executes at the very start of the function, before any of the effects:
+
+```solidity
+_checkpoint(msg.sender);         // external call — no state changed yet
+// ...
+totalAssets += assets;           // effects
+totalSupply += shares;
+balanceOf[msg.sender] += shares;
+asset.safeTransferFrom(...);     // interaction (token pull)
+```
+
+The `nonReentrant` modifier fully prevents exploitation today because `_entered` is set before `_checkpoint` fires and before any storage is modified. However, this depends on the modifier remaining in place, and it creates a subtler hazard: if `safeTransferFrom` fails (e.g., insufficient allowance), the entire transaction reverts correctly. But if the distributor performs irreversible off-chain actions or emits events whose consumers don't respect reverts, those effects have already fired before the failure.
+
+**Conditions required:**
+Currently fully mitigated by `nonReentrant`. Risk materialises if the guard is ever removed or a future refactor reorders operations.
+
+**Recommendation:** Restructure to strict CEI: call `_checkpoint` and perform all storage writes, then do `safeTransferFrom` last. This eliminates the dependency on the guard for correctness.
+
+---
+
+### [I-1] `Ownable2Step.transferOwnership` accepts `address(0)` as `newOwner`
+
+**File / function:** `src/auth/Ownable2Step.sol` — `transferOwnership` (line 30).
+
+Setting `pendingOwner = address(0)` is the de facto mechanism to cancel a pending transfer, but it also emits `OwnershipTransferStarted(owner, address(0))`. Off-chain monitors and indexers that watch this event may misinterpret it as a renounce-ownership action rather than a cancellation. There is no `cancelOwnershipTransfer` function that would make the intent explicit.
+
+**Recommendation:** Add a dedicated `cancelOwnershipTransfer` function that clears `pendingOwner` and emits a distinct event, and reject `address(0)` in `transferOwnership`.
+
+---
+
+### Summary table
+
+| ID | Severity | Contract | Function | Impact |
+|----|----------|----------|----------|--------|
+| H-1 | High | `StakingVault` | `setRewardDistributor` / `_checkpoint` | User shares permanently frozen if distributor fails |
+| M-1 | Medium | `FixedPointMath` → `StakingVault` | `mulDiv` / `convertToAssets` / `convertToShares` | Overflow DoS bricks deposits and withdrawals |
+| L-1 | Low | `StakingVault` | `completeWithdrawal` | Fee revenue silently redirected by live recipient lookup |
+| L-2 | Low | `StakingVault` | `setGuardian` | Zero address silently removes guardian role |
+| L-3 | Low | `StakingVault` | `deposit` | CEI violation (currently mitigated by `nonReentrant`) |
+| I-1 | Info | `Ownable2Step` | `transferOwnership` | Misleading event when cancelling pending transfer |

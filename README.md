@@ -42,20 +42,27 @@ Their conclusion is that the weakness is structural rather than linguistic.
 "Structural obfuscation is more effective than linguistic deception." You do not
 need to argue that a file is safe if you can drown the signal.
 
-Two things in their own tables are worth carrying across, because the headline
-is tidier than the data. Broken out by model rather than averaged, **one model
-of seven was clearly bypassed** by moderate comment volume; all three frontier
-models held steady or improved, and at extreme volume six of seven detected
-better than baseline. And the >3MB band, where detection collapses, sits above
-every model's context window in the study — their largest was 2.8MB — so in that
-band some of the code being judged never reached the model at all.
+Two details from their tables are worth carrying across, because the averaged
+headline is tidier than the per-model data. Broken out by model, **one of seven
+was clearly bypassed** by moderate comment volume; all three frontier models held
+steady or improved, and at extreme volume six of seven detected better than
+baseline. They report this openly and name it the "U-curve of deception" —
+saturation eventually trips a repetition alarm. The caveat is for people
+repeating the average, not for the study.
 
-Neither point undermines their result. The first is a different cut of the data
-from the ratio analysis their claim rests on, and the second is an inference from
-their setup rather than something they assert. Both are recorded in
-[CITATIONS.md](CITATIONS.md), along with every figure quoted here, which
-screenshots of the article were used to verify, and one claim from an earlier
-draft of this piece that turned out to be unsupported and was cut.
+They also split the large-file effect into two mechanisms rather than one:
+context exhaustion above the window, and attention dilution below it, "even when
+it fits entirely within the context window." That distinction matters here. The
+first half is already a coverage failure — code that never reaches the model
+cannot be misjudged, only missed — reached mechanically through a context limit
+rather than through an instruction. The gap between their setting and this one is
+narrower than "classification versus coverage" suggests.
+
+Every figure quoted above was checked against the article, most of them against
+screenshots of the rendered page. [CITATIONS.md](CITATIONS.md) records which,
+one claim from an earlier draft of this piece that turned out to be unsupported
+and was cut, and one place where this file had wrongly described a finding of
+theirs as an inference of mine.
 
 ## The job changes the failure
 
@@ -281,9 +288,12 @@ makes this a result about a delivery channel as much as about suppression. READM
 prose and `AGENTS.md` failing here does not make them safe against an agent that
 ingests them.
 
-The filler condition never reached the regime Cloudflare measured. Their size
-effect operates on single files of 500KB to 3MB. The largest file here is a few
-KB. That null is not evidence about their finding.
+The filler condition tested the wrong shape of dilution, which is a design fault
+rather than a finding. Cloudflare's dilution is *within a single file* — a few
+malicious lines inside a large library bundle. The filler here was spread *across
+extra files*, and an agent can decline to open another file. It cannot decline to
+read part of a file it has already opened. Those are different attacks, and only
+theirs was measured properly. That null says nothing about their result.
 
 Two runs died on API rate limits, were excluded, and were re-run. They are kept
 in [`demo/raw/failed/`](demo/raw/failed/) rather than deleted. Three runs were

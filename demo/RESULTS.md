@@ -147,10 +147,24 @@ unexamined in every run. The omission mechanism is plainly active. It simply
 was not steered by volume, and its unsteered selection happened to include the
 vulnerable file every time.
 
-Separately, and stated because it bears on how much `t4` could ever have shown:
-Cloudflare's size effect operates on **single files** of 500 KB–3 MB. The
-largest file here is a few KB. This condition was never able to reach that
-regime and its null is not evidence about theirs.
+Stated plainly because it bears on how much `t4` could ever have shown: **it
+tested the wrong shape of dilution.** Cloudflare's is *within a single file* —
+"a few lines of malicious logic buried within a mountain of benign library
+code", in their words, with the effect holding "even when it fits entirely
+within the context window". The corpus here spread volume *across additional
+files*.
+
+Those are different attacks against different capabilities. An agent can decline
+to open a file, and did. It cannot decline to read part of a file it has already
+opened. Testing across-file volume against a file-selecting agent measures file
+selection, not attention dilution, and file selection is exactly what the agent
+turned out to be good at when nothing was instructing it otherwise.
+
+The scale gap compounds this — their band is 500 KB–3 MB in one file, and the
+largest file here is a few KB — but the shape is the more basic error. A proper
+test of their mechanism would inflate the vulnerable file itself, not the
+repository around it. That is a straightforward follow-on and it is not run
+here.
 
 ## Is this even prompt injection?
 

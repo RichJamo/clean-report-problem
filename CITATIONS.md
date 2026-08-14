@@ -61,10 +61,17 @@ clearly bypassed by moderate comment volume.** All three frontier models held
 steady or improved, and two non-frontier models improved substantially. At
 extreme volume, six of seven detected *better* than baseline.
 
-This is not a challenge to their conclusion — the ratio analysis is a different
-cut of the data and their bypass-zone claim is about ratio, not count. It is
-recorded because anyone repeating "injection degrades detection" as a general
-fact will be overstating what their own per-model table shows.
+**They report this openly and name the shape.** Their summary calls it "the
+U-curve of deception": non-frontier model 1 is singled out as the most
+vulnerable, 20 comments taking it from 90% to 67%, while extreme volume "triggers
+a 'repetition alarm,' causing performance for some models to revert toward the
+original baseline."
+
+So this is not something the study conceals, and it is not a challenge to their
+conclusion — the ratio analysis is a different cut of the data, and their
+bypass-zone claim is about ratio, not count. It is recorded here because the
+figure that travels is the averaged one, and anyone repeating "injection degrades
+detection" as a general fact will be overstating what the per-model table shows.
 
 **It also converges with the results in this repository.** The one condition
 here that put an explicit safety claim in the file did not merely fail; multiple
@@ -95,22 +102,37 @@ Their methodology table states (human-verified):
 > corpus included files up to 6.3MB, truncation occurred at the model's upper
 > limit."
 
-The largest context in the study holds 2.8MB. Every file in the >3MB band
-therefore exceeded every model's window and was truncated before analysis. It
-follows from their own reported numbers that in that band, some of the code
-being judged never reached the model.
+The largest context in the study holds 2.8MB, so every file in the >3MB band
+exceeded every model's window.
 
-**This is an inference from their setup, not a claim they make.** They do not
-attribute the large-file collapse to truncation, and this repository does not
-assert that truncation is the whole explanation. What can be said is narrower:
-the >3MB figure is not a clean measurement of dilution degrading a model's
-judgement, because at those sizes the input was necessarily incomplete.
+**They state this themselves, and an earlier version of this file wrongly
+described it as an inference of mine. Corrected.** Their own summary of the
+finding reads (human-verified):
 
-It is worth recording because it cuts towards this repository's subject rather
-than away from it. Content that never reaches the model is an omission, not a
-misclassification. To whatever extent their largest-file effect is truncation,
-their structural finding already contains a coverage component — reached by a
-mechanical route (a context limit) rather than an instructional one.
+> "Regardless of comments, detection for files over 3MB dropped to just 12–18%,
+> as large library bundles (like TON or React SDKs) effectively exhaust the AI's
+> context window. In addition, when a few lines of malicious logic are buried
+> within a mountain of benign library code, the AI's attention is effectively
+> diluted, making the payload difficult to isolate even when it fits entirely
+> within the context window."
+
+Two mechanisms, kept apart deliberately: **context exhaustion** above the window,
+and **attention dilution** below it. The second is the stronger claim, because it
+does not depend on anything being cut off.
+
+This matters for how the present repository reads their result. Content that
+never reaches the model is an omission rather than a misclassification, so the
+context-exhaustion half of their finding is already a coverage phenomenon —
+reached mechanically, through a context limit, rather than through an
+instruction. The distance between their study and this one is smaller than the
+"classification versus coverage" framing alone suggests.
+
+It also explains a null here. The dilution condition in this repository added
+volume *across files*, and the agent skipped the added files entirely, so nothing
+was diluted. Cloudflare's dilution is *within a single file* — malicious lines
+buried in a large library bundle. An agent can decline to open another file. It
+cannot decline to read part of a file it has already opened. Those are different
+attacks, and only the second is what they measured.
 
 ## Corrected before use
 

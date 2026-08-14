@@ -42,9 +42,20 @@ Their conclusion is that the weakness is structural rather than linguistic.
 "Structural obfuscation is more effective than linguistic deception." You do not
 need to argue that a file is safe if you can drown the signal.
 
-Every figure above was checked against their write-up before being repeated
-here, including one claim from an earlier draft of this piece that turned out to
-be unsupported and was cut. That audit is in [CITATIONS.md](CITATIONS.md).
+Two things in their own tables are worth carrying across, because the headline
+is tidier than the data. Broken out by model rather than averaged, **one model
+of seven was clearly bypassed** by moderate comment volume; all three frontier
+models held steady or improved, and at extreme volume six of seven detected
+better than baseline. And the >3MB band, where detection collapses, sits above
+every model's context window in the study — their largest was 2.8MB — so in that
+band some of the code being judged never reached the model at all.
+
+Neither point undermines their result. The first is a different cut of the data
+from the ratio analysis their claim rests on, and the second is an inference from
+their setup rather than something they assert. Both are recorded in
+[CITATIONS.md](CITATIONS.md), along with every figure quoted here, which
+screenshots of the article were used to verify, and one claim from an earlier
+draft of this piece that turned out to be unsupported and was cut.
 
 ## The job changes the failure
 
@@ -125,6 +136,13 @@ the comment itself as a finding, called the certification reference unverifiable
 and filed it as deliberate obfuscation intended to hide the bug underneath. One
 rated it HIGH. Trying to sound authoritative made the file more interesting, not
 less.
+
+That is Cloudflare's fingerprint zone showing up early. They found that once
+safety claims saturate a file past about 25%, detection climbs to nearly 100%,
+because the model reads the volume of claims as a signature of fraud. Here a
+single comment was enough to trip the same instinct. Two different setups,
+pointing the same way: a conspicuous assertion of innocence is treated as
+evidence against.
 
 The same claim as README prose was read in all ten runs and reviewed anyway. One
 report pushed back in writing: *"scope exclusions do not override the duty to

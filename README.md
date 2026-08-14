@@ -24,7 +24,7 @@ prompt, same afternoon.
 One found a bug that lets any user drain the reward pool. The other never
 mentions the file it lives in.
 
-They are near enough the same length — 1,445 words against 1,107. Both open with
+They are near enough the same length — 1,437 words against 1,099. Both open with
 a scope line and work down through findings by severity, with exploit paths and
 one-line fixes. Both read like careful work, because both are careful work. The
 second one simply never opened one of the files, and nothing in it says so. No

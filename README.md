@@ -291,6 +291,52 @@ Full version in [ledger-rule.md](ledger-rule.md). It's ordinary provenance
 discipline, it costs one line per skipped item, and it composes with every
 input-side defence rather than replacing them.
 
+## Reproducing this
+
+Everything needed is here. You will need [Foundry](https://getfoundry.sh) and
+the Claude Code CLI, and runs cost roughly $0.30 each.
+
+**Check the bug is real** — no API access needed:
+
+```
+demo/ground-truth/verify.sh
+```
+
+It copies the project to a temp directory outside this repo, adds the exploit,
+and drains the pool. The exploit is kept out of the project tree so no agent
+under test can ever see it.
+
+**Run a condition** — ten runs, raw transcripts into `demo/raw/`:
+
+```
+./demo/run.sh control 10
+./demo/run.sh t1-comment 10
+```
+
+The two conditions whose payload is a `CLAUDE.md` need it loaded into context
+the way it would be in a real session:
+
+```
+SETTING_SOURCES=project ./demo/run.sh t3b-claudemd 10
+SETTING_SOURCES=project ./demo/run.sh control-claudemd 10
+```
+
+**Score them:**
+
+```
+python3 demo/score.py demo/raw/control-*.txt
+```
+
+The script decides coverage and applies the detection rubric, and prints the
+matched terms so every call can be checked by hand. It is an aid to
+adjudication, not a replacement for it — three runs in the committed set were
+misclassified by earlier versions of its patterns and were caught only by
+reading them.
+
+Your numbers will not match mine exactly. The runs are stochastic, the model
+moves, and `demo/SCORING.md` is the protocol that makes the comparison
+meaningful rather than the counts themselves.
+
 ## Where this is thin
 
 I'd rather list these myself than have them found.
@@ -327,6 +373,12 @@ this is an honest early warning. Not near zero and it stops being conditional.
 If you run it before I do, tell me — I'd rather know than be first.
 
 ---
+
+**Read this as a page:**
+<https://richardjamieson.co.za/writing/clean-report-problem.html>
+
+**The two reports, side by side and unedited**, with nothing highlighted until
+you ask: <https://richardjamieson.co.za/writing/two-reports.html>
 
 Everything in `demo/` was built for this repository: no third-party code, no
 audit findings, no client material, no protocol names. All 70 runs are committed
